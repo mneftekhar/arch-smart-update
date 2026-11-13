@@ -94,6 +94,7 @@ Optional: add it to your application menu with `./smart-update.sh --install-desk
 | `./smart-update.sh --auto` | Applies safe fixes without asking |
 | `./smart-update.sh --download-only` | Downloads now, install later (good on slow internet) |
 | `./smart-update.sh --diagnose FILE` | Explains a saved pacman / paru / yay error log |
+| `./smart-update.sh --setup` | Checks what the script needs, explains why, installs what's missing |
 | `./smart-update.sh --help` | All options |
 
 **Keys while it runs:** `Ctrl+C` skips the current step · `Ctrl+\` stops everything (postponed
@@ -177,9 +178,21 @@ Most of these can also be changed from **Settings** in the menu.
 
 ## Requirements
 
-Arch Linux (or an Arch-based distribution) with `bash`, `sudo` and `curl`.
-Optional: `paru` or `yay` for the AUR (it can install one for you), `flatpak`, `snapd`, `reflector`,
-`aria2`, `zenity` / `kdialog` for desktop dialogs.
+Arch Linux or an Arch-based distribution. **You don't need to prepare anything:** on the first run the
+script checks what it uses, tells you what is missing and *why*, and installs it if you agree.
+
+| | Packages | Why |
+|---|---|---|
+| **Needed** | `sudo` `curl` `gawk` `sed` `grep` `findutils` `util-linux` `procps-ng` | Run pacman as root, check the network and read pacman's output — on almost every Arch system already |
+| **Recommended** | `pacman-contrib` `reflector` | Count updates safely, clean the cache, merge `.pacnew` files, pick fast mirrors |
+| | `git` `base-devel` `rebuild-detector` | Build AUR packages and rebuild the ones a library update broke *(only if you use the AUR)* |
+| | `libnotify` | Desktop notifications *(only if they're on)* |
+| **Optional** | `aria2` `psmisc` `lm_sensors` `iproute2` | Faster rescue downloads, "who holds this file", temperatures, local proxy detection |
+
+If your package lists are too old to install something on its own, it is queued and installed together
+with the next full update — never as a risky partial upgrade. Run the check again anytime with
+`./smart-update.sh --setup` or **Repair tools → Check requirements**. Flatpak, Snap and fwupd are used
+when installed, never required.
 
 <sub>[↑ back to contents](#contents)</sub>
 

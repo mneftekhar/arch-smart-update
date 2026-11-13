@@ -135,6 +135,7 @@ PAC_PROXY=""                 # proxy that pacman's downloads go through this run
 RESCUE_PROXY=""
 REPORT_FILE=""
 REPORT_ONLY=false
+SETUP_REQUESTED=""
 NOTIFY_ID=""
 SLOW_LEVEL=0                 # 0 normal | 1 fewer parallel downloads, no timeout | 2 curl with retries + HTTP/1.1
 declare -a SKIP_REPOS=() AUR_IGNORE=()
@@ -3680,7 +3681,13 @@ runner_sync() { GUARD=safe run_logged sudo env LC_ALL=C pacman "${PAC_OPTS[@]}" 
 
 runner_keyring() { GUARD=keyring run_logged sudo env LC_ALL=C pacman "${PAC_OPTS[@]}" -S --needed --noconfirm "${KEYRINGS_TO_UPDATE[@]}"; }
 
-runner_install() { GUARD=install run_logged sudo env LC_ALL=C pacman "${PAC_OPTS[@]}" -Su --noconfirm; }
+runner_install() {  # queued requirements (see deps_install) are installed in the same transaction
+    local extra=(); mapfile -t extra < <(deps_pending)
+    (( ${#extra[@]} )) && extra=(--needed "${extra[@]}")
+    GUARD=install run_logged sudo env LC_ALL=C pacman "${PAC_OPTS[@]}" -Su --noconfirm "${extra[@]}"
+    local rc=$?; (( rc == 0 && ${#extra[@]} )) && rm -f "$STATE_DIR/deps_pending"
+    return $rc
+}
 
 pending_download_bytes() {  # bytes still to download, -1 if unknown
     local out rc total=0 f s d found
@@ -3789,14 +3796,134 @@ runner_snap() {
 # ======================================================================
 # PRE-FLIGHT CHECKS
 # ======================================================================
+# ======================================================================
+# REQUIREMENTS — what this script needs, explained, installed on request
+# ======================================================================
+# "tier|package|commands that prove it is there (- = check the package)|why it is needed|only when"
+DEPS_SPEC=(
+    "required|sudo|sudo|Runs pacman and the repairs as root, while the script itself stays your normal user."
+    "required|curl|curl|Checks the internet connection, reads Arch news and the AUR, tests mirrors and fetches blocked downloads."
+    "required|gawk|awk|Reads pacman's output and the logs to work out what went wrong."
+    "required|sed|sed|Tidies command output and edits a config line when a fix needs it."
+    "required|grep|grep|Recognises error messages in pacman's output."
+    "required|findutils|find xargs|Finds leftover files, old caches and broken links."
+    "required|util-linux|script flock|Lets pacman ask its questions while the output is recorded, and stops two copies from running at once."
+    "required|procps-ng|pgrep|Notices another package manager (Discover, pamac) before touching pacman's lock."
+    "recommended|pacman-contrib|checkupdates paccache pacdiff|Counts updates without changing anything, cleans old cached packages and merges .pacnew config files."
+    "recommended|reflector|reflector|Picks fast, up-to-date mirrors when downloads are slow or failing.|nomirrors"
+    "recommended|git|git|Downloads AUR package recipes, and an AUR helper if you have none.|aur"
+    "recommended|base-devel|-|The compilers and tools makepkg needs to build AUR packages.|aur"
+    "recommended|rebuild-detector|checkrebuild|Finds AUR programs that a library update broke, so they are rebuilt instead of crashing.|aur"
+    "recommended|libnotify|notify-send|Desktop notifications when an update finishes or needs you.|notify"
+    "optional|aria2|aria2c|Downloads blocked packages from several mirrors at once — much faster on filtered networks."
+    "optional|psmisc|fuser|Shows which program holds a file that blocks an update."
+    "optional|lm_sensors|sensors|Adds CPU temperatures to the health report."
+    "optional|iproute2|ss|Finds a local proxy (v2ray, clash, Tor…) to route blocked downloads through."
+)
+DEPS_MISS=()
+
+deps_missing() {  # -> DEPS_MISS: "tier|package|why" for everything not installed (features you use only)
+    DEPS_MISS=()
+    local e tier pkg cmds why cond c miss
+    for e in "${DEPS_SPEC[@]}"; do
+        IFS='|' read -r tier pkg cmds why cond <<<"$e"
+        case $cond in
+            aur)       [[ $DO_AUR == true ]] || continue ;;
+            notify)    [[ $NOTIFY_ENABLED == true && -n ${DISPLAY:-${WAYLAND_DISPLAY:-}} ]] || continue ;;
+            nomirrors) have pacman-mirrors && continue ;;   # Manjaro ranks mirrors with its own tool
+        esac
+        miss=0
+        if [[ $cmds == - ]]; then pacman -Qq "$pkg" &>/dev/null || miss=1
+        else for c in $cmds; do have "$c" || { miss=1; break; }; done; fi
+        (( miss )) && DEPS_MISS+=("$tier|$pkg|$why")
+    done
+}
+
+deps_install() {  # deps_install PKG... -> 0 installed, 2 queued for the next full update, 1 failed
+    local s=(sudo) rc
+    [[ $EUID -eq 0 ]] && s=()
+    if (( EUID != 0 )) && ! have sudo; then
+        log_error "sudo is missing, so nothing can be installed as your user. As root: pacman -S sudo, then allow your user with visudo."
+        return 1
+    fi
+    log_info "Installing: $*"
+    "${s[@]}" env LC_ALL=C pacman -S --needed --noconfirm "$@" 2>&1 | tee "${TMP:-/tmp}/deps.log" | grep -E '^(error|warning|installing|upgrading|:: )' | grep -v 'Proceed with' | sed 's/^/     /'
+    rc=${PIPESTATUS[0]}
+    (( rc == 0 )) && { log_success "Installed: $*"; return 0; }
+    if grep -qE 'failed retrieving file|target not found|404' "${TMP:-/tmp}/deps.log"; then
+        mkdir -p "$STATE_DIR"; printf '%s\n' "$@" >>"$STATE_DIR/deps_pending"
+        log_warning "Your package lists are out of date, so these can't be installed on their own yet. They will be installed together with the next full update (installing them alone now could mix old and new packages)."
+        return 2
+    fi
+    log_error "Could not install: $*  — run: sudo pacman -S --needed $*"
+    return 1
+}
+
+deps_pending() { [[ -s $STATE_DIR/deps_pending ]] && sort -u "$STATE_DIR/deps_pending"; }
+
+deps_check() {  # deps_check [setup] — on the first run, with --setup, or whenever something needed is missing
+    local mode=${1:-auto} first=0 e tier pkg why declined body="" b
+    local -a req=() rec=() opt=() btn=()
+    [[ -f $STATE_DIR/setup_done && $mode != setup ]] || first=1
+    deps_missing
+    declined=" $(cat "$STATE_DIR/deps_declined" 2>/dev/null | tr '\n' ' ') "
+    for e in "${DEPS_MISS[@]}"; do
+        IFS='|' read -r tier pkg why <<<"$e"
+        [[ $tier != required ]] && { (( first )) || continue; [[ $mode != setup && $declined == *" $pkg "* ]] && continue; }
+        [[ " $(deps_pending | tr '\n' ' ') " == *" $pkg "* ]] && continue    # already queued for the next update
+        case $tier in required) req+=("$pkg") ;; recommended) rec+=("$pkg") ;; optional) opt+=("$pkg") ;; esac
+        body+="$tier|$pkg|$why"$'\n'
+    done
+    mkdir -p "$STATE_DIR"
+    if (( ${#req[@]} + ${#rec[@]} + ${#opt[@]} == 0 )); then
+        : >"$STATE_DIR/setup_done"
+        [[ $mode == setup ]] && log_success "Everything Arch Smart Update uses is installed$( [[ -n $(deps_pending) ]] && echo " (queued for the next update: $(deps_pending | tr '\n' ' '))")"
+        return 0
+    fi
+    local text="Arch Smart Update uses a few standard Arch packages. Not installed yet:"$'\n'
+    for tier in required recommended optional; do
+        local head; case $tier in required) head="Needed to run" ;; recommended) head="Recommended" ;; optional) head="Optional extras" ;; esac
+        grep -q "^$tier|" <<<"$body" || continue
+        text+=$'\n'"$head"$'\n'
+        while IFS='|' read -r tier pkg why; do text+="  • $pkg — $why"$'\n'; done < <(grep "^$tier|" <<<"$body")
+    done
+    local all=("${req[@]}" "${rec[@]}" "${opt[@]}")
+    text+=$'\n'"Command: sudo pacman -S --needed ${all[*]}"
+
+    if [[ ! -t 0 && $GUI != true ]]; then   # cron, pipes: never ask
+        printf '%s\n' "$text" | sed 's/^/  /' >&2
+        if (( ${#req[@]} )); then
+            [[ $FIX_MODE == auto ]] && deps_install "${req[@]}" && return 0
+            log_error "Missing required packages: ${req[*]} — install them and run again."; exit 1
+        fi
+        : >"$STATE_DIR/setup_done"; return 0
+    fi
+
+    btn=("Install all")
+    (( ${#req[@]} && ${#rec[@]} + ${#opt[@]} )) && btn+=("Only what's needed")
+    (( ! ${#req[@]} && ${#rec[@]} && ${#opt[@]} )) && btn+=("Skip the extras")
+    if (( ${#req[@]} )); then btn+=("Quit"); else btn+=("Not now"); fi
+    ui_dialog "📦 Before the first run" "$text" 0 $(( ${#btn[@]} - 1 )) "${btn[@]}"
+    b=${btn[TUI_CHOICE]:-}
+    case $b in
+        "Install all")        deps_install "${all[@]}" ;;
+        "Only what's needed") deps_install "${req[@]}"; printf '%s\n' "${rec[@]}" "${opt[@]}" >>"$STATE_DIR/deps_declined" ;;
+        "Skip the extras")    deps_install "${rec[@]}"; printf '%s\n' "${opt[@]}" >>"$STATE_DIR/deps_declined" ;;
+        "Not now")            printf '%s\n' "${rec[@]}" "${opt[@]}" >>"$STATE_DIR/deps_declined"
+                              log_info "Skipped. Run '$PROG --setup' (or Repair tools → Check requirements) to see this again." ;;
+        *)                    log_info "Needed to run: ${req[*]}  — install with: sudo pacman -S --needed ${req[*]}"; exit 1 ;;
+    esac
+    : >"$STATE_DIR/setup_done"
+    deps_missing
+    for e in "${DEPS_MISS[@]}"; do
+        IFS='|' read -r tier pkg why <<<"$e"
+        [[ $tier == required && " $(deps_pending | tr '\n' ' ') " != *" $pkg "* ]] && { log_error "Still missing: $pkg — the script can't run without it."; exit 1; }
+    done
+    return 0
+}
+
 check_dependencies() {
-    local opt=()
     have pacman || { log_error "pacman not found — this script is for Arch-based systems"; exit 1; }
-    have reflector || have pacman-mirrors || opt+=("reflector")
-    have paccache || opt+=("pacman-contrib")
-    [[ $NOTIFY_ENABLED == true ]] && ! have notify-send && opt+=("libnotify")
-    [[ $GUI == true ]] && [[ -z $GUI_TOOL ]] && opt+=("zenity")
-    (( ${#opt[@]} )) && log_info "Optional tools that improve this script: ${opt[*]}  (sudo pacman -S ${opt[*]})"
     return 0
 }
 
@@ -3998,7 +4125,14 @@ update_official() {
     run_step "Sync package databases" pacman runner_sync || return 1
 
     local pending; pending=$(pacman "${PAC_OPTS[@]}" -Qu 2>/dev/null)
-    if [[ -z $pending ]]; then log_success "Official packages are up to date"; return 0; fi
+    if [[ -z $pending ]]; then
+        log_success "Official packages are up to date"
+        if [[ -n $(deps_pending) ]]; then   # lists are fresh and nothing else changes: safe to install them now
+            local q; mapfile -t q < <(deps_pending)
+            deps_install "${q[@]}" && rm -f "$STATE_DIR/deps_pending"
+        fi
+        return 0
+    fi
     local n; n=$(wc -l <<<"$pending")
     log_info "$n package(s) to upgrade:"
     head -30 <<<"$pending" | sed 's/^/     /'
@@ -5047,8 +5181,10 @@ action_tools() {
             stale    "🕰️  Prepare a long-outdated system (retired repos, mirrors, keyring)" \
             helperfix "🧰 Repair a broken AUR helper (paru / yay won't start)" \
             services "🔁 Restart failed services (and check they really run)" \
+            deps     "📦 Check requirements (what the script needs, and why)" \
             back     "← Back") || return 0
         [[ $t == back ]] && return 0
+        [[ $t == deps ]] && { deps_check setup; pause; continue; }
         (
             trap - INT
             CLEAN_LOG=/dev/null
@@ -6153,6 +6289,7 @@ Interface
   --no-notify          No desktop notifications
 
 Other
+  --setup              Check what the script needs, explain it, and install what is missing
   --config             Write a config template to $CONFIG_FILE
   --install-desktop    Add an application-menu launcher (GUI mode)
   --version, -h|--help
@@ -6181,6 +6318,7 @@ parse_args() {
         case $1 in
             --dry-run)     DRY_RUN=true ;;
             --report)      REPORT_ONLY=true ;;
+            --setup)       SETUP_REQUESTED=true ;;
             --mirrors)     FORCE_MIRRORS=true ;;
             --no-notify)   NOTIFY_ENABLED=false ;;
             --zfs)         SNAPSHOT_TOOL=zfs ;;
@@ -6285,6 +6423,9 @@ main() {
     init_runtime
     state_write
     [[ $GUI == true && ! -t 0 ]] && setup_askpass
+    have pacman || { echo "pacman not found — Arch Smart Update is for Arch Linux and Arch-based systems." >&2; exit 1; }
+    [[ ${REPORT_ONLY:-} == true ]] || deps_check "${SETUP_REQUESTED:+setup}"
+    [[ ${SETUP_REQUESTED:-} == true ]] && return 0
     start_ticker
 
     if [[ ${REPORT_ONLY:-} == true ]]; then
