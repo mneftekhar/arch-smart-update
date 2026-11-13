@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arch Smart Update</title>
+<meta name="description" content="One command to update Arch Linux — official packages, AUR, Flatpak and Snap — with plain-language fixes when something goes wrong.">
+<meta property="og:title" content="Arch Smart Update">
+<meta property="og:description" content="Update Arch Linux with one command. When something fails, it explains why and fixes it.">
+<meta property="og:image" content="https://mneftekhar.github.io/arch-smart-update/screenshots/menu.png">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 3 29 16 16 29 3 16Z' fill='%238b5cf6'/%3E%3C/svg%3E">
+<style>
+:root{
+  --bg:#fbfaff; --surface:#ffffff; --text:#1d1b26; --muted:#5f5b6e; --line:#e7e4f0;
+  --accent:#7c3aed; --accent-soft:#f1ebfe; --code-bg:#1e1e2e; --code-text:#e6e3f5;
+  --shadow:0 1px 2px rgba(29,27,38,.04),0 12px 32px rgba(29,27,38,.08);
+  --radius:14px; --max:1040px;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#121019; --surface:#1a1724; --text:#ece9f6; --muted:#a9a3bd; --line:#2b2738;
+    --accent:#a78bfa; --accent-soft:#241d38; --code-bg:#0d0b13; --code-text:#e6e3f5;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 12px 32px rgba(0,0,0,.35);
+  }
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+body{margin:0;background:var(--bg);color:var(--text);
+  font:17px/1.65 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Inter","Noto Sans",sans-serif}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline;text-underline-offset:3px}
+code,pre{font-family:ui-monospace,"JetBrains Mono","SF Mono",Menlo,Consolas,monospace}
+img{max-width:100%;height:auto;display:block}
+.wrap{max-width:var(--max);margin:0 auto;padding:0 20px}
+
+/* nav */
+header{position:sticky;top:0;z-index:10;background:color-mix(in srgb,var(--bg) 86%,transparent);
+  backdrop-filter:saturate(1.4) blur(10px);-webkit-backdrop-filter:saturate(1.4) blur(10px);border-bottom:1px solid var(--line)}
+.nav{display:flex;align-items:center;gap:24px;height:58px}
+.brand{font-weight:650;color:var(--text);display:flex;align-items:center;gap:9px;white-space:nowrap}
+.brand:hover{text-decoration:none}
+.brand i{width:12px;height:12px;background:var(--accent);transform:rotate(45deg);border-radius:2px;display:inline-block}
+.nav nav{display:flex;gap:22px;margin-left:auto;font-size:15px}
+.nav nav a{color:var(--muted)} .nav nav a:hover{color:var(--text);text-decoration:none}
+.gh{display:inline-flex;align-items:center;gap:7px;font-size:15px;font-weight:550;color:var(--text);
+  border:1px solid var(--line);padding:6px 12px;border-radius:9px;background:var(--surface)}
+.gh:hover{text-decoration:none;border-color:var(--muted)}
+.gh svg{width:16px;height:16px;fill:currentColor}
+@media (max-width:720px){.nav nav{display:none}.gh{margin-left:auto}}
+
+/* hero */
+.hero{padding:80px 20px 72px;text-align:center}
+.eyebrow{display:inline-block;font-size:13px;font-weight:600;letter-spacing:.04em;color:var(--accent);
+  background:var(--accent-soft);padding:5px 12px;border-radius:99px;margin-bottom:22px}
+h1{font-size:clamp(34px,6vw,56px);line-height:1.08;letter-spacing:-.025em;margin:0 auto 18px;max-width:19ch;font-weight:720}
+.lead{font-size:clamp(17px,2.2vw,20px);color:var(--muted);max-width:40ch;margin:0 auto 32px}
+.install{display:inline-flex;align-items:center;max-width:100%;background:var(--code-bg);color:var(--code-text);
+  border-radius:12px;padding:6px 6px 6px 18px;gap:14px;box-shadow:var(--shadow)}
+.install code{font-size:14.5px;white-space:nowrap;overflow-x:auto;scrollbar-width:none}
+.install code::-webkit-scrollbar{display:none}
+.install code b{color:#a78bfa;font-weight:500;user-select:none}
+.copy{flex:none;border:0;cursor:pointer;font:600 13px/1 system-ui,sans-serif;color:#1d1b26;background:#e6e3f5;
+  padding:10px 14px;border-radius:8px}
+.copy:hover{background:#fff}
+.copy:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.sub{font-size:14px;color:var(--muted);margin-top:14px}
+.shot{margin:56px auto 0;max-width:980px}
+.shot img{border-radius:var(--radius);box-shadow:0 2px 6px rgba(20,16,40,.08),0 30px 70px -20px rgba(60,30,120,.35)}
+
+/* sections */
+section{padding:72px 0;border-top:1px solid var(--line)}
+section:first-of-type{border-top:0}
+.kicker{font-size:13px;font-weight:650;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);margin:0 0 10px}
+h2{font-size:clamp(26px,3.6vw,36px);line-height:1.15;letter-spacing:-.02em;margin:0 0 14px;font-weight:700;max-width:22ch}
+.intro{color:var(--muted);max-width:56ch;margin:0 0 40px}
+
+/* pros */
+.pros{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px}
+.pro{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:24px}
+.pro .ic{width:38px;height:38px;border-radius:10px;background:var(--accent-soft);color:var(--accent);
+  display:grid;place-items:center;margin-bottom:16px}
+.pro .ic svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.pro h3{font-size:18px;margin:0 0 6px;letter-spacing:-.01em}
+.pro p{margin:0;color:var(--muted);font-size:15.5px}
+
+/* see it */
+.duo{display:grid;grid-template-columns:1fr 1fr;gap:28px}
+@media (max-width:820px){.duo{grid-template-columns:1fr}}
+figure{margin:0}
+figure img{border-radius:12px;box-shadow:0 1px 3px rgba(20,16,40,.08),0 18px 40px -16px rgba(60,30,120,.3)}
+.demo{max-width:980px;margin:0 auto 40px}
+.demo img{width:100%;border-radius:14px;box-shadow:0 2px 6px rgba(20,16,40,.08),0 30px 70px -20px rgba(60,30,120,.35)}
+figcaption{font-size:15px;color:var(--muted);margin-top:12px;padding:0 4px}
+figcaption b{color:var(--text);font-weight:600}
+
+/* steps */
+.steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:18px;counter-reset:s;margin:0;padding:0;list-style:none}
+.steps li{counter-increment:s;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:22px 24px}
+.steps li::before{content:counter(s);display:inline-grid;place-items:center;width:28px;height:28px;border-radius:50%;
+  background:var(--accent);color:#fff;font-weight:700;font-size:14px;margin-bottom:12px}
+.steps h3{font-size:17px;margin:0 0 6px}
+.steps p{margin:0;color:var(--muted);font-size:15.5px}
+.steps code{font-size:13.5px;background:var(--accent-soft);color:var(--text);padding:2px 6px;border-radius:5px;word-break:break-word}
+
+/* footer */
+footer{border-top:1px solid var(--line);padding:32px 0 48px;color:var(--muted);font-size:14.5px}
+footer .wrap{display:flex;flex-wrap:wrap;gap:12px 24px;justify-content:space-between}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap nav">
+    <a class="brand" href="#top" aria-label="Arch Smart Update, back to top"><i></i>Arch Smart Update</a>
+    <nav aria-label="Sections">
+      <a href="#why">Why</a>
+      <a href="#see-it">See it</a>
+      <a href="#start">Get started</a>
+    </nav>
+    <a class="gh" href="https://github.com/mneftekhar/arch-smart-update">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38v-1.33c-2.23.48-2.7-1.07-2.7-1.07-.36-.92-.89-1.17-.89-1.17-.73-.5.05-.49.05-.49.8.06 1.23.83 1.23.83.72 1.22 1.87.87 2.33.66.07-.52.28-.87.5-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.6 7.6 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48v2.2c0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+      GitHub
+    </a>
+  </div>
+</header>
+
+<main id="top">
+  <div class="wrap hero">
+    <span class="eyebrow">For Arch Linux · free &amp; open source</span>
+    <h1>Update Arch without the worry.</h1>
+    <p class="lead">One command updates everything. If something breaks, it tells you why in plain words — and fixes it.</p>
+    <div class="install">
+      <code id="cmd"><b>$ </b>git clone https://github.com/mneftekhar/arch-smart-update &amp;&amp; ./arch-smart-update/smart-update.sh</code>
+      <button class="copy" type="button" data-copy="git clone https://github.com/mneftekhar/arch-smart-update && ./arch-smart-update/smart-update.sh">Copy</button>
+    </div>
+    <p class="sub">A single Bash script · nothing else to install · MIT licensed</p>
+    <div class="shot">
+      <img src="site/menu.png" width="1600" height="1086" alt="The Arch Smart Update menu: update, diagnose and repair, software and system sections, each item with a hotkey">
+    </div>
+  </div>
+
+  <section id="why">
+    <div class="wrap">
+      <p class="kicker">Why use it</p>
+      <h2>Everything a careful update needs, done for you.</h2>
+      <p class="intro">You keep control of every change. It does the remembering, the ordering and the troubleshooting.</p>
+      <div class="pros">
+        <div class="pro">
+          <div class="ic"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg></div>
+          <h3>One command, whole system</h3>
+          <p>Official packages, AUR, Flatpak, Snap, firmware and cleanup — in the right order, with Arch news checked first.</p>
+        </div>
+        <div class="pro">
+          <div class="ic"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg></div>
+          <h3>Errors in plain language</h3>
+          <p>When a step fails you see the likely cause and why it happened — not a wall of pacman output.</p>
+        </div>
+        <div class="pro">
+          <div class="ic"><svg viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.5 2.5-2.4-.6-.6-2.4Z"/></svg></div>
+          <h3>Fixes itself — with your OK</h3>
+          <p>60+ known problems come with a ready fix: keyrings, mirrors, locks, conflicts, AUR builds, broken links and more.</p>
+        </div>
+        <div class="pro">
+          <div class="ic"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 15h18M7 18h4"/></svg></div>
+          <h3>Calm while it works</h3>
+          <p>A fixed status bar shows phase, progress, time and data used. Long builds shrink to a single line.</p>
+        </div>
+        <div class="pro">
+          <div class="ic"><svg viewBox="0 0 24 24"><path d="M12 3 4 6v6c0 4.5 3.4 8.3 8 9 4.6-.7 8-4.5 8-9V6Z"/><path d="m9 12 2 2 4-4"/></svg></div>
+          <h3>Never half-updated</h3>
+          <p>Stopping waits until pacman finishes installing. Files are moved to a backup, not deleted, with the restore command shown.</p>
+        </div>
+        <div class="pro">
+          <div class="ic"><svg viewBox="0 0 24 24"><path d="M2 9a15 15 0 0 1 20 0M5.5 12.5a10 10 0 0 1 13 0M9 16a5 5 0 0 1 6 0"/><path d="M12 19.5h.01"/></svg></div>
+          <h3>Made for unreliable internet</h3>
+          <p>Resumable downloads, DNS-over-HTTPS fallback, in-country mirrors and proxy detection get updates through slow or filtered networks.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="see-it">
+    <div class="wrap">
+      <p class="kicker">See it work</p>
+      <h2>Quiet when things go right. Clear when they don't.</h2>
+      <p class="intro">A real update, recorded as it ran. Personal details are blurred.</p>
+      <figure class="demo">
+        <picture>
+          <source srcset="site/update.png" media="(prefers-reduced-motion: reduce)">
+          <img src="site/demo.gif" width="976" height="648" loading="lazy" alt="Demo: choosing Full smart update in the menu, then the update runs through every phase while the status bar fills to 100 percent and a summary appears">
+        </picture>
+        <figcaption><b>A full update, start to finish.</b> Menu, every phase, then the summary — sped up about 3×.</figcaption>
+      </figure>
+      <div class="duo">
+        <figure>
+          <img src="site/update.png" width="1600" height="1086" loading="lazy" alt="An update in progress: steps scroll by above a status bar showing phases, a progress bar at 42 percent, time and data used">
+          <figcaption><b>The live view.</b> Steps scroll above; the status bar below always shows where you are.</figcaption>
+        </figure>
+        <figure>
+          <img src="site/fix.png" width="1600" height="1086" loading="lazy" alt="A fix dialog explaining that a service failed and why, with Apply, Skip, Yes to all, Details and Quit fixing buttons">
+          <figcaption><b>A fix, explained first.</b> What failed, why, and buttons to apply it, skip it, or see the exact commands.</figcaption>
+        </figure>
+      </div>
+    </div>
+  </section>
+
+  <section id="start">
+    <div class="wrap">
+      <p class="kicker">Get started</p>
+      <h2>Ready in under a minute.</h2>
+      <p class="intro">Works on Arch Linux and Arch-based distributions with <code>bash</code>, <code>sudo</code> and <code>curl</code>. No AUR helper yet? It can install one for you.</p>
+      <ol class="steps">
+        <li><h3>Get the script</h3><p><code>git clone https://github.com/mneftekhar/arch-smart-update</code></p></li>
+        <li><h3>Open the menu</h3><p><code>./arch-smart-update/smart-update.sh</code> — pick an item with a click, the arrows or its hotkey.</p></li>
+        <li><h3>Or update right away</h3><p><code>--run</code> for a full update, <code>--dry-run</code> to preview, <code>--auto</code> to apply safe fixes without asking.</p></li>
+      </ol>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>Arch Smart Update · MIT License</span>
+    <span><a href="https://github.com/mneftekhar/arch-smart-update">Source on GitHub</a> · <a href="https://github.com/mneftekhar/arch-smart-update#what-it-can-fix">Everything it can fix</a></span>
+  </div>
+</footer>
+
+<script>
+document.querySelectorAll('.copy').forEach(function (b) {
+  b.addEventListener('click', function () {
+    var t = b.getAttribute('data-copy');
+    var done = function () { b.textContent = 'Copied'; setTimeout(function () { b.textContent = 'Copy'; }, 1600); };
+    if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(t).then(done, function () {}); }
+    else { var a = document.createElement('textarea'); a.value = t; document.body.appendChild(a); a.select();
+      try { document.execCommand('copy'); done(); } catch (e) {} a.remove(); }
+  });
+});
+</script>
+</body>
+</html>
