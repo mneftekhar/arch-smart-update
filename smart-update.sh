@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================================
-#  ARCH SMART UPDATE  v4.0
+#  ARCH SMART UPDATE  v4.1
 #  A simple, self-repairing updater for Arch Linux (terminal + desktop)
 #  MIT License — https://github.com/mneftekhar/arch-smart-update
 #
@@ -35,7 +35,7 @@
 set -o pipefail
 shopt -s nullglob
 
-VERSION="4.0.0"
+VERSION="4.1.0"
 SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 PROG="${SELF##*/}"
 ORIG_ARGS=("$@")
@@ -87,6 +87,22 @@ DO_SNAP=true
 DO_FIRMWARE=true
 DO_CLEANUP=true
 DO_HEALTH=true
+
+# Scheduled updates (menu → Scheduled updates, or --schedule). A systemd user timer checks every few
+# minutes whether now is a good moment; nothing runs while SCHED_ENABLED=false.
+SCHED_ENABLED=false
+SCHED_TRIGGER="night"        # night = inside SCHED_WINDOW while idle | idle = any time the computer is idle | time = at SCHED_TIME
+SCHED_DAYS="daily"           # daily, or days: "Sun", "Sat,Sun", "Mon,Wed,Fri"
+SCHED_TIME="03:00"           # trigger=time (if busy/on battery then, it retries for 3 hours)
+SCHED_WINDOW="01:00-06:00"   # trigger=night; may cross midnight (23:30-06:00)
+SCHED_IDLE_MIN=15            # minutes without keyboard/mouse that count as idle (0 = do not wait)
+SCHED_MAX_LOAD=50            # CPU load (% of all cores) above which the computer is not idle
+SCHED_VIEW="simple"          # simple = automatic in the background | detailed = terminal opens, you see and answer everything
+SCHED_TASK="full"            # full | official | download
+SCHED_MISSED="next-idle"     # computer was off/busy: next-idle = run at the next idle moment | next-window = wait for the next window
+SCHED_WINDOW_END="skip"      # night window ends without an idle moment: skip (and notify) | run anyway
+SCHED_AC_ONLY=true           # laptops: wait for the charger
+SCHED_SKIP_METERED=true      # wait while the connection is metered (phone hotspot…)
 
 # shellcheck source=/dev/null
 [[ -f $CONFIG_FILE ]] && source "$CONFIG_FILE"
@@ -147,6 +163,11 @@ DOWNLOAD_ONLY=false
 FIX_YES_ALL=0
 MENU_REQUESTED=""
 BOOT_PKG=""
+INTERACTIVE_ALL=false        # detailed view: pacman/AUR/Flatpak ask their own questions, fixes and steps are confirmed
+GATE_STOP=false
+SCHED_CHECK=false            # --scheduled (called by the timer)
+SCHEDULED_RUN=false          # this update was started by the schedule
+SCHED_CMD=""                 # --schedule [status|on|off|test|log]
 
 # ----------------------------------------------------------------------
 # COLOURS
@@ -582,17 +603,17 @@ gui_pulse_stop() {
 }
 
 setup_askpass() {  # GUI without a terminal: let sudo ask for the password in a dialog
-    local ap="$TMP/askpass.sh"
+    local ap="$TMP/askpass.sh" to=${ASKPASS_TIMEOUT:-0}   # 0 = wait as long as it takes
     case $GUI_TOOL in
         zenity)  printf '#!/bin/sh
-exec zenity --password --title="%s"
-' "$APP_TITLE" >"$ap" ;;
+exec timeout %s zenity --password --title="%s"
+' "$to" "$APP_TITLE" >"$ap" ;;
         yad)     printf '#!/bin/sh
-exec yad --entry --hide-text --title="%s" --text="sudo password"
-' "$APP_TITLE" >"$ap" ;;
+exec timeout %s yad --entry --hide-text --title="%s" --text="sudo password"
+' "$to" "$APP_TITLE" >"$ap" ;;
         kdialog) printf '#!/bin/sh
-exec kdialog --password "sudo password for %s"
-' "$APP_TITLE" >"$ap" ;;
+exec timeout %s kdialog --password "sudo password for %s"
+' "$to" "$APP_TITLE" >"$ap" ;;
     esac
     chmod 700 "$ap"
     export SUDO_ASKPASS="$ap"
@@ -3602,11 +3623,19 @@ apply_fixes() {  # returns 0 if at least one fix was applied
 # RECOVERY RUNNER
 # ======================================================================
 run_logged() {  # run a command, show + capture output in $ATTEMPT_LOG
-    if (( INTERACTIVE_NEXT )) && [[ -t 0 ]]; then
+    if { (( INTERACTIVE_NEXT )) || [[ $INTERACTIVE_ALL == true ]]; } && [[ -t 0 ]]; then
         INTERACTIVE_NEXT=0
-        local args=() a
-        for a in "$@"; do [[ $a == --noconfirm || $a == --no-confirm ]] || args+=("$a"); done
-        log_warning "Answer pacman's questions below. Once it starts installing, do not press Ctrl+C or $STOP_KEY_LABEL until it has finished."
+        local args=() a fp=false
+        [[ " $* " == *" flatpak "* ]] && fp=true
+        for a in "$@"; do
+            case $a in
+                --noconfirm|--no-confirm|--noninteractive) continue ;;
+                -y) [[ $fp == true ]] && continue ;;   # flatpak update -y
+            esac
+            args+=("$a")
+        done
+        log_warning "Answer the questions below yourself. Once it starts installing, do not press Ctrl+C or $STOP_KEY_LABEL until it has finished."
+        [[ $INTERACTIVE_ALL == true ]] && printf '%s$ %s%s\n' "$GRAY" "${args[*]}" "$NC"
         script -qefc "$(printf '%q ' "${args[@]}")" "$ATTEMPT_LOG"
         a=$?; check_pending_stop; return "$a"
     fi
@@ -5106,8 +5135,9 @@ menu_status() {
     local last h
     last=$(last_full_upgrade_epoch)
     h=$(find_aur_helper)
-    printf 'Last full upgrade: %s  ·  AUR helper: %s  ·  Fixes: %s\nDownloaded this session: %s  ·  Emergency stop: Ctrl+\\' \
-        "$( (( last > 0 )) && date -d @"$last" '+%a %-d %b, %H:%M' || echo never)" "$h" "$FIX_MODE" "$(human "$(net_used)")"
+    printf 'Last full upgrade: %s  ·  AUR helper: %s  ·  Fixes: %s\nDownloaded this session: %s  ·  Emergency stop: Ctrl+\\\n%s' \
+        "$( (( last > 0 )) && date -d @"$last" '+%a %-d %b, %H:%M' || echo never)" "$h" "$FIX_MODE" "$(human "$(net_used)")" \
+        "$(sched_status_line)"
 }
 
 aur_only_guard() {
@@ -5125,6 +5155,9 @@ run_action() {  # runs in a subshell so an abort returns to the menu
         trap - INT
         case $mode in
             full) ;;
+            detailed) INTERACTIVE_ALL=true FIX_MODE=ask UPDATE_VIEW=classic
+                      detail_plan
+                      ui_ask "Start the update?" y || exit 0 ;;
             official) DO_AUR=false DO_FLATPAK=false DO_SNAP=false DO_FIRMWARE=false DO_HEALTH=false ;;
             aur)      DO_OFFICIAL=false DO_FLATPAK=false DO_SNAP=false DO_FIRMWARE=false DO_CLEANUP=false DO_HEALTH=false; aur_only_guard ;;
             apps)     DO_OFFICIAL=false DO_AUR=false DO_FIRMWARE=false DO_CLEANUP=false DO_HEALTH=false ;;
@@ -5315,6 +5348,7 @@ interactive_menu() {
         choice=$(ui_choose "$APP_TITLE v$VERSION" "$(menu_status)" \
             @update  "Update" \
             full     "🚀 Full smart update (official + AUR + apps + cleanup)" \
+            detailed "🔍 Full update, detailed view (see everything, answer every question yourself)" \
             official "📦 Update official packages only" \
             aur      "🧩 Update AUR packages only" \
             apps     "📱 Update Flatpak / Snap apps" \
@@ -5332,11 +5366,13 @@ interactive_menu() {
             health   "🩺 Health report (services, .pacnew, disks, reboot)" \
             report   "🧾 Detailed system report (what could interfere with updates, and why)" \
             logs     "📜 View logs" \
+            schedule "⏰ Scheduled updates (when, how often, simple or detailed view)" \
             settings "⚙️  Settings" \
             quit     "🚪 Quit") || break
-        case $choice in tools|settings|logs|quit|"") ;; *) screen_fresh ;; esac
+        case $choice in tools|settings|schedule|logs|quit|"") ;; *) screen_fresh ;; esac
         case $choice in
-            full|official|aur|apps|preview|download) run_action "$choice" ;;
+            full|detailed|official|aur|apps|preview|download) run_action "$choice" ;;
+            schedule) action_schedule; continue ;;
             news)     ( trap - INT; preflight ) ;;
             diagnose) action_diagnose ;;
             install)  ( trap - INT; action_install ) ;;
@@ -5779,7 +5815,294 @@ for r in d.get("results", []):
 
 pkg_name_of() { local d=${1%%:*}; d=${d%%[<>=]*}; printf '%s' "$d"; }   # "foo>=1.2: desc" -> foo
 
-pm_search() {  # pm_search QUERY -> R_KEYS / R_LABELS ("repo:name" / "aur:name")
+# Search results with what people want to know before installing: what it is (app, plugin of which
+# program, library, font/theme, language pack), how popular it is (share of Arch users from
+# pkgstats.archlinux.de, AUR votes), when it was last updated, and whether it is out of date / orphaned.
+read -r -d '' PM_ENRICH_PY <<'PYEOF'
+import json, re, subprocess, sys, time, urllib.parse, urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+query, repo_file, meta_file = sys.argv[1], sys.argv[2], sys.argv[3]
+UA = {"User-Agent": "arch-smart-update"}
+now = time.time()
+
+def get(url, timeout=15):
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+def base(dep):  # "obs-studio>=28: text" -> obs-studio
+    return re.split(r"[<>=:]", dep.strip(), maxsplit=1)[0].strip()
+
+pk = {}  # name -> record
+order = []
+def add(name, **kw):
+    if name in pk:
+        return
+    rec = dict(name=name, src="", repo="", ver="", desc="", inst=False, votes=None, pop=None,
+               updated=0, ood=False, deps=[], url="", maint="", users=None, prov=set(), conf=set(), alt="", groups=[])
+    rec.update(kw); pk[name] = rec; order.append(name)
+
+# official repositories (pacman -Ss, done by the shell)
+for line in open(repo_file, encoding="utf-8", errors="replace"):
+    p = line.rstrip("\n").split("|", 4)
+    if len(p) == 5:
+        add(p[0], src="repo", repo=p[1], ver=p[2], inst=p[3] == "1", desc=p[4])
+
+repo_names = [n for n in order]
+if repo_names:   # build date, URL and dependencies of every repo hit in one pacman call
+    try:
+        out = subprocess.run(["pacman", "-Si", "--"] + repo_names[:150], capture_output=True, text=True,
+                             env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"}, timeout=30).stdout
+    except Exception:
+        out = ""
+    cur, key = None, None
+    for line in out.splitlines():
+        m = re.match(r"^([A-Za-z][A-Za-z ]+?)\s*: (.*)$", line)
+        if m:
+            key, val = m.group(1), m.group(2)
+            if key == "Name": cur = pk.get(val)
+            elif cur is None: continue
+            elif key == "URL": cur["url"] = val if val != "None" else ""
+            elif key == "Depends On": cur["deps"] = [] if val == "None" else [base(d) for d in val.split()]
+            elif key == "Groups": cur["groups"] = [] if val == "None" else val.split()
+            elif key == "Provides": cur["prov"] = set() if val == "None" else {base(d) for d in val.split()}
+            elif key == "Conflicts With": cur["conf"] = set() if val == "None" else {base(d) for d in val.split()}
+            elif key == "Build Date":
+                try:
+                    cur["updated"] = int(time.mktime(time.strptime(val, "%a %b %d %H:%M:%S %Y")))
+                except Exception:
+                    pass
+
+# AUR: search, then one info call for the dependencies
+installed = set(subprocess.run(["pacman", "-Qq"], capture_output=True, text=True).stdout.split())
+repo_all = set(subprocess.run(["pacman", "-Slq"], capture_output=True, text=True).stdout.split())
+aur = get("https://aur.archlinux.org/rpc/v5/search/%s?by=name-desc" % urllib.parse.quote(query)) or {}
+hits = sorted(aur.get("results", []), key=lambda r: -(r.get("Popularity") or 0))[:60]
+for r in hits:
+    add(r["Name"], src="aur", ver=r.get("Version", ""), desc=(r.get("Description") or "").replace("\n", " "),
+        inst=r["Name"] in installed, votes=r.get("NumVotes", 0), pop=r.get("Popularity") or 0,
+        updated=r.get("LastModified") or 0, ood=bool(r.get("OutOfDate")), url=r.get("URL") or "",
+        maint=r.get("Maintainer") or "")
+aur_names = [r["Name"] for r in hits]
+for i in range(0, len(aur_names), 60):
+    chunk = aur_names[i:i + 60]
+    info = get("https://aur.archlinux.org/rpc/v5/info?" + "&".join("arg[]=" + urllib.parse.quote(n) for n in chunk)) or {}
+    for r in info.get("results", []):
+        if r["Name"] in pk:
+            pk[r["Name"]]["deps"] = [base(d) for d in r.get("Depends", [])]
+            pk[r["Name"]]["prov"] = {base(d) for d in r.get("Provides", [])}
+            pk[r["Name"]]["conf"] = {base(d) for d in r.get("Conflicts", [])}
+
+# pkgstats: share of Arch users that have it installed (official + AUR)
+ps = get("https://pkgstats.archlinux.de/api/packages?limit=250&query=%s" % urllib.parse.quote(query)) or {}
+for r in ps.get("packagePopularities", []):
+    if r.get("name") in pk:
+        pk[r["name"]]["users"] = r.get("popularity")
+missing = [n for n in order if pk[n]["users"] is None][:50]
+def one(n):
+    r = get("https://pkgstats.archlinux.de/api/packages/" + urllib.parse.quote(n), timeout=10)
+    return n, (r or {}).get("popularity")
+with ThreadPoolExecutor(16) as ex:
+    for n, v in ex.map(one, missing):
+        if v is not None:
+            pk[n]["users"] = v
+
+# ---------- categories ----------
+RUNTIMES = {"glibc", "gcc-libs", "sh", "bash", "python", "python2", "perl", "ruby", "nodejs", "lua", "java-runtime",
+            "java-environment", "qt5-base", "qt6-base", "qt6-declarative", "gtk2", "gtk3", "gtk4", "glib2", "libx11",
+            "systemd", "systemd-libs", "zlib", "openssl", "curl", "electron", "dbus", "hicolor-icon-theme", "php", "r",
+            "go", "rust", "dotnet-runtime", "mono", "jre-openjdk", "libnotify", "desktop-file-utils"}
+LIB_PRE = ("lib", "python-", "python2-", "perl-", "ruby-", "nodejs-", "node-", "rust-", "go-", "haskell-", "lua-",
+           "lua51-", "lua52-", "lua53-", "lua54-", "r-", "php-", "ocaml-", "java-", "qt5-", "qt6-", "kf5-", "kf6-",
+           "lib32-", "mingw-w64-", "dotnet-", "gnome-shell-extension-libs", "elixir-", "julia-")
+PLUG_WORD = re.compile(r"\b(plug-?ins?|extensions?|add-?ons?|addons?|integration|module for|theme for|skins? for)\b", re.I)
+LIB_WORD = re.compile(r"\b(library|libraries|bindings?|sdk|module for (python|perl|ruby|node)|python module|perl module)\b", re.I)
+LOOK = re.compile(r"(^(ttf|otf|woff2?)-|fonts?|-icon-theme|icon[- ]theme|cursor[- ]theme|-gtk-theme|-kde-theme|plasma theme|wallpapers?|-theme(-git)?$)", re.I)
+OTHER = re.compile(r"-(docs?|debug|headers|devel|examples|man|manual)(-git)?$")
+
+def known(x):
+    return x in pk or x in installed or x in repo_all
+
+def to_app(x):  # vlc-plugins-base / libvlc -> vlc (the program people actually know)
+    for c in (re.sub(r"-(plugins?-base|base|common|core|data|libs?)$", "", x), x[3:] if x.startswith("lib") else ""):
+        if c and c != x and known(c) and c not in RUNTIMES:
+            return c
+    return x
+
+def parent_of(r):
+    n = r["name"]; deps = [d for d in r["deps"] if d and d != n]
+    for g in r["groups"]:   # pacman groups like firefox-addons, gimp-plugins, kdevelop-plugins
+        m = re.match(r"^(.+?)-(addons|plugins|extensions)$", g)
+        if m and known(m.group(1)): return m.group(1)
+    head = n.split("-")[0]
+    m = re.match(r"^(.+?)-(?:plugins?|extensions?|add-?ons?|integration|module)(?:-|$)", n)
+    if m and known(m.group(1)) and m.group(1) not in RUNTIMES:
+        return m.group(1)
+    for d in deps:   # obs-move-transition -> obs-studio, vim-fugitive -> vim, vlc-plugin-x -> libvlc -> vlc
+        a = to_app(d)
+        if a not in RUNTIMES and (n.startswith(a + "-") or a.split("-")[0] == head) and not a.startswith(LIB_PRE):
+            return a
+    m = re.search(r"\b(?:plug-?in|extension|add-?on|addon|integration|theme|module)s? for (?:the )?([A-Za-z0-9.+_-]+)", r["desc"], re.I)
+    if m:
+        c = m.group(1).rstrip(".,").lower()
+        if known(c): return c
+        for d in deps + list(pk):
+            if d.startswith(c + "-") and known(d) and not d.startswith(LIB_PRE): return d
+    for d in deps:
+        a = to_app(d)
+        if a not in RUNTIMES and re.search(r"\b%s\b" % re.escape(a), r["desc"], re.I):
+            return a
+    for d in deps:
+        a = to_app(d)
+        if a not in RUNTIMES and not a.startswith(LIB_PRE):
+            return a
+    return ""
+
+for n in order:
+    r = pk[n]; t = n + " " + r["desc"]
+    cat, par = "app", ""
+    if re.search(r"-(i18n|l10n|langpack|lang|help)-[A-Za-z_@-]+$", n) or re.search(r"\b(language pack|help files|translations? for)\b", r["desc"], re.I):
+        cat = "lang"; par = parent_of(r) or n.split("-")[0]
+    elif OTHER.search(n):
+        cat = "other"
+    elif LOOK.search(n) or re.search(r"\b(font|icon theme|cursor theme|gtk theme|wallpaper)", r["desc"], re.I):
+        cat = "look"
+    elif PLUG_WORD.search(t) or re.search(r"-(plugins?|extension|addon|integration)(-|$)", n) \
+            or any(re.search(r"-(addons|plugins|extensions)$", g) for g in r["groups"]):
+        cat = "plugin"; par = parent_of(r)
+        if not par:
+            cat = "app"
+    elif n.startswith(LIB_PRE) or LIB_WORD.search(r["desc"]):
+        cat = "lib"
+    else:
+        p = parent_of(r)
+        if p and n.startswith(p + "-") and (p in pk or p in installed):   # obs-move-transition needs obs-studio
+            cat, par = "plugin", p
+    if par and (par in r["prov"] or par in r["conf"] or (par in pk and pk[par]["desc"] and pk[par]["desc"][:40] == r["desc"][:40]
+                                                        and not PLUG_WORD.search(n))):
+        cat, par, r["alt"] = "app", "", par      # vlc-luajit, obs-studio-git: the app itself, built differently
+    ql = query.lower()
+    r["rel"] = 2 if ql in n.lower() else (1 if re.search(r"\b" + re.escape(ql), r["desc"], re.I) else 0)
+    if r["rel"] == 0 and cat not in ("plugin", "lang"):
+        cat = "weak"
+    r["cat"], r["par"] = cat, par
+
+def ago(t):
+    if not t: return ""
+    d = (now - t) / 86400
+    if d < 1: return "today"
+    if d < 2: return "yesterday"
+    if d < 60: return "%d days ago" % d
+    if d < 730: return "%d months ago" % (d / 30)
+    return "%d years ago" % (d / 365)
+
+def users(v):
+    if v is None: return ""
+    if v >= 1: return "%.0f%% of Arch users" % v if v >= 10 else "%.1f%% of Arch users" % v
+    if v > 0: return "%.2f%% of Arch users" % v
+    return "rarely used"
+
+def label(r):
+    icon = "📦" if r["src"] == "repo" else "🧩"
+    bits = ["%s %s %s" % (icon, r["name"], r["ver"])]
+    src = r["repo"] if r["src"] == "repo" else "AUR"
+    if r["inst"]: src = "✔ installed · " + src
+    bits.append(src)
+    if r["cat"] in ("plugin", "lang"): bits.append("🔌 needs " + r["par"])
+    if r["alt"]: bits.append("↔ part or variant of " + r["alt"])
+    if r["src"] == "aur": bits.append("★ %d votes" % (r["votes"] or 0))
+    u = users(r["users"])
+    if u: bits.append("👥 " + u)
+    a = ago(r["updated"])
+    if a: bits.append("🕒 " + a)
+    if r["ood"]: bits.append("⚠ out of date")
+    if r["src"] == "aur" and not r["maint"]: bits.append("⚠ orphaned")
+    return " · ".join(bits) + (" — " + r["desc"] if r["desc"] else "")
+
+def score(r):
+    return (r["users"] or 0) * 100 + (r["votes"] or 0) / 50 + (r["pop"] or 0)
+
+def emit(key, title):
+    print("%s\t%s" % (key, title))
+
+rows = sorted(order, key=lambda n: (-pk[n]["rel"], -score(pk[n])))
+exact = [n for n in rows if n == query or n in (query + "-bin", query + "-git")]
+rest = [n for n in rows if n not in exact]
+if exact:
+    emit("@exact", "Exact match")
+    for n in exact: emit(pk[n]["src"] + ":" + n, label(pk[n]))
+apps = [n for n in rest if pk[n]["cat"] == "app"]
+if apps:
+    emit("@apps", "Applications & tools")
+    for n in apps: emit(pk[n]["src"] + ":" + n, label(pk[n]))
+groups = {}
+for n in rest:
+    if pk[n]["cat"] == "plugin": groups.setdefault(pk[n]["par"], []).append(n)
+for par in sorted(groups, key=lambda p: (-len(groups[p]), p)):
+    st = "✔ installed" if par in installed else "not installed — it comes along as a dependency"
+    emit("@plug-" + par, "🔌 Plugins & add-ons for %s (they need %s to work · %s)" % (par, par, st))
+    for n in groups[par]: emit(pk[n]["src"] + ":" + n, label(pk[n]))
+for cat, title in (("lib", "Libraries & modules (used by other programs; you rarely install these yourself)"),
+                   ("look", "Fonts, themes & icons"),
+                   ("lang", "Language packs & help files (each needs its program)"),
+                   ("other", "Documentation, debug and development files"),
+                   ("weak", "Other matches (the word only appears inside other words of the description)")):
+    ns = [n for n in rest if pk[n]["cat"] == cat]
+    if ns:
+        emit("@" + cat, title)
+        for n in ns: emit(pk[n]["src"] + ":" + n, label(pk[n]))
+
+# details for the package screen: name|cat|parent|users|votes|updated|url|plugins-of-it
+plugs = {}
+for n in order:
+    if pk[n]["cat"] == "plugin": plugs.setdefault(pk[n]["par"], []).append(n)
+with open(meta_file, "w", encoding="utf-8") as f:
+    for n in order:
+        r = pk[n]
+        f.write("|".join([n, r["cat"], r["par"], "" if r["users"] is None else str(r["users"]), "" if r["votes"] is None else str(r["votes"]),
+                          str(int(r["updated"] or 0)), r["url"].replace("|", "%7C"), ",".join(plugs.get(n, []))]) + "\n")
+PYEOF
+
+pm_search() {  # pm_search QUERY -> R_KEYS / R_LABELS ("repo:name" / "aur:name"), grouped by kind; $TMP/search_meta for details
+    local q=$1 k l
+    R_KEYS=() R_LABELS=()
+    if ! have python3; then pm_search_basic "$q"; return; fi
+    LC_ALL=C pacman -Ss -- "$q" 2>/dev/null | head -n 200 | awk 'NR % 2 == 1 { split($1, a, "/"); inst = ($0 ~ /\[installed/) ? 1 : 0
+        repo = a[1]; name = a[2]; ver = $2; getline d; sub(/^ +/, "", d); gsub(/\|/, "/", d); print name "|" repo "|" ver "|" inst "|" d }' >"$TMP/search_repo"
+    while IFS=$'\t' read -r k l; do
+        [[ -n $k ]] && { R_KEYS+=("$k"); R_LABELS+=("$l"); }
+    done < <(timeout 60 python3 -I -c "$PM_ENRICH_PY" "$q" "$TMP/search_repo" "$TMP/search_meta" 2>>"$TMP/search_err")
+    (( ${#R_KEYS[@]} )) || pm_search_basic "$q"
+    return 0
+}
+
+pm_about() {  # pm_about NAME -> lines for the details screen (from the last search)
+    local n c par users votes upd url plugs line
+    line=$(grep -m1 "^$1|" "$TMP/search_meta" 2>/dev/null) || return 0
+    IFS='|' read -r n c par users votes upd url plugs <<<"$line"
+    case $c in
+        plugin) printf 'Kind:        🔌 plugin / add-on for %s — it only works with %s (%s)\n' "$par" "$par" \
+                    "$(pacman -Qq -- "$par" &>/dev/null && echo "installed" || echo "not installed; it is installed with it")" ;;
+        lang)   printf 'Kind:        🌐 language pack or help files for %s\n' "$par" ;;
+        lib)    printf 'Kind:        📚 library / module — other programs use it; on its own it does nothing visible\n' ;;
+        look)   printf 'Kind:        🎨 font, theme or icons\n' ;;
+        other)  printf 'Kind:        📄 documentation, debug or development files\n' ;;
+        *)      printf 'Kind:        🖥  application or tool\n' ;;
+    esac
+    [[ -n $users ]] && printf 'Popularity:  👥 installed on %s%% of Arch systems that report statistics (pkgstats)\n' "$users"
+    [[ -n $votes ]] && printf 'Votes:       ★ %s on the AUR\n' "$votes"
+    (( upd > 0 )) && printf 'Last update: 🕒 %s (%s)\n' "$(date -d "@$upd" +%F)" "$(sched_ago "$upd")"
+    [[ -n $url ]] && printf 'Homepage:    %s\n' "${url//%7C/|}"
+    if [[ -n $plugs ]]; then
+        local list; IFS=, read -ra list <<<"$plugs"
+        printf 'Add-ons:     %d plugin(s) for it were found, e.g. %s\n' "${#list[@]}" "$(printf '%s, ' "${list[@]:0:6}" | sed 's/, $//')"
+    fi
+}
+
+pm_search_basic() {  # without python3: pacman -Ss + AUR, no categories
     local q=$1 line repo name ver rest desc inst tag
     R_KEYS=() R_LABELS=()
     local -a exact=() exactl=() repo_k=() repo_l=() aur_k=() aur_l=()
@@ -5869,7 +6192,8 @@ pm_install_plan() {  # pm_install_plan repo|aur NAME EXTRAS... -> PLAN_TEXT, PLA
     if [[ $kind == repo ]]; then
         local info; info=$(LC_ALL=C pacman -Si -- "$name" 2>/dev/null)
         PLAN_TEXT+="$(awk -F': ' '/^Description/ {print $2; exit}' <<<"$info")"$'\n'
-        PLAN_TEXT+="Version $(awk -F': ' '/^Version/ {print $2; exit}' <<<"$info") · from [$(awk -F': ' '/^Repository/ {print $2; exit}' <<<"$info")] · signed by the Arch packagers"$'\n\n'
+        PLAN_TEXT+="Version $(awk -F': ' '/^Version/ {print $2; exit}' <<<"$info") · from [$(awk -F': ' '/^Repository/ {print $2; exit}' <<<"$info")] · signed by the Arch packagers"$'\n'
+        PLAN_TEXT+="$(pm_about "$name")"$'\n\n'
         PLAN_TEXT+="WILL BE INSTALLED"$'\n'
         while IFS='|' read -r n v r s; do
             [[ -n $n ]] || continue
@@ -5888,6 +6212,7 @@ pm_install_plan() {  # pm_install_plan repo|aur NAME EXTRAS... -> PLAN_TEXT, PLA
         PLAN_TEXT+="Version ${ai[Version]} · AUR · maintainer: ${ai[Maintainer]:-none (orphaned)} · ★${ai[NumVotes]} · updated $(date -d "@${ai[LastModified]:-0}" +%F 2>/dev/null)"$'\n'
         [[ -n ${ai[OutOfDate]} ]] && PLAN_TEXT+="⚠ Flagged out of date since $(date -d "@${ai[OutOfDate]}" +%F 2>/dev/null)"$'\n'
         [[ -z ${ai[Maintainer]} ]] && PLAN_TEXT+="⚠ Orphaned: nobody maintains this package"$'\n'
+        PLAN_TEXT+="$(pm_about "$name")"$'\n'
         PLAN_TEXT+="AUR packages are built on your computer from a script anyone can upload: read the PKGBUILD when the helper shows it."$'\n\n'
         IFS=$'\t' read -ra deps <<<"${ai[Depends]}"
         IFS=$'\t' read -ra optl <<<"${ai[OptDepends]}"
@@ -5958,10 +6283,10 @@ action_install() {
     ui_input "Install software" "Search the official repositories and the AUR (name or words from the description):" "" || return 0
     q=${TUI_INPUT//[[:space:]]/ }; q=${q# }; q=${q% }
     [[ -n $q ]] || return 0
-    log_info "Searching for '$q'…"
+    log_info "Searching for '$q'… (also asking pkgstats.archlinux.de and the AUR how popular each result is)"
     pm_search "$q"
     if (( ${#R_KEYS[@]} == 0 )); then ui_dialog "Nothing found" "No package matches '$q' in the official repositories or the AUR." 0 0 OK; return 0; fi
-    key=$(ui_choose "Results for '$q'" "📦 official repository · 🧩 AUR · ✔ already installed" "${R_KEYS[@]}") || return 0
+    key=$(ui_choose "Results for '$q'" "📦 official · 🧩 AUR · ✔ installed · 👥 share of Arch users who have it · ★ AUR votes · 🕒 last update · 🔌 needs that program · ↔ variant" "${R_KEYS[@]}") || return 0
     kind=${key%%:*} name=${key#*:}
     pm_choose_installer "$kind" || return 0
     PICKED=()
@@ -6202,6 +6527,662 @@ $(sed 's/^/  - /' <<<"$cas")" 1 1 "Remove all of these" Back
 # ======================================================================
 # ENTRY POINTS
 # ======================================================================
+# ======================================================================
+# SCHEDULED UPDATES
+#   A systemd *user* timer wakes "smart-update.sh --scheduled" every few
+#   minutes. That check is cheap and decides whether NOW is a good moment
+#   (the right day, inside the time window, computer idle, on AC power, not
+#   on a metered connection, nothing else installing). Only then does it
+#   start the update — automatically in the background (simple view) or in
+#   a terminal window where you watch and answer everything (detailed view).
+# ======================================================================
+SCHED_UNIT="arch-smart-update"
+SCHED_UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+SCHED_LOG="$STATE_DIR/schedule.log"
+IDLE_FILE="${XDG_RUNTIME_DIR:-/run/user/$UID}/smart-update-idle"
+SCHED_VERBOSE=false
+SCHED_TEST=false
+
+sched_log() {  # one line in the schedule log (and on screen when testing)
+    mkdir -p "$STATE_DIR"
+    printf '%s  %s\n' "$(date '+%F %T')" "$*" >>"$SCHED_LOG"
+    if (( $(wc -l <"$SCHED_LOG") > 800 )); then tail -n 500 "$SCHED_LOG" >"$SCHED_LOG.tmp" && mv -f "$SCHED_LOG.tmp" "$SCHED_LOG"; fi
+    [[ $SCHED_VERBOSE == true ]] && printf '  %s\n' "$*"
+    return 0
+}
+
+sched_note() {  # like sched_log, but a reason that repeats every few minutes is written only once
+    local last; last=$(cat "$STATE_DIR/sched_note" 2>/dev/null)
+    [[ $SCHED_VERBOSE == true ]] && printf '  %s\n' "$1"
+    [[ $last == "$1" ]] && return 0
+    printf '%s' "$1" >"$STATE_DIR/sched_note"
+    SCHED_VERBOSE=false sched_log "waiting: $1"
+}
+
+sched_hm() {  # "HH:MM" -> seconds after midnight; 1 = not a valid time
+    [[ $1 =~ ^([01]?[0-9]|2[0-3]):([0-5][0-9])$ ]] || return 1
+    echo $(( 10#${BASH_REMATCH[1]} * 3600 + 10#${BASH_REMATCH[2]} * 60 ))
+}
+
+sched_norm_days() {  # "sat, SUNDAY" -> "Sat,Sun"; "daily" stays; 1 = nothing valid
+    local in=${1,,} d out=() n
+    [[ $in == daily || $in == "every day" || $in == all || -z $in ]] && { echo daily; return 0; }
+    case $in in weekdays) echo "Mon,Tue,Wed,Thu,Fri"; return 0 ;; weekend) echo "Sat,Sun"; return 0 ;; esac
+    for d in ${in//,/ }; do
+        d=${d:0:3}
+        case $d in mon|tue|wed|thu|fri|sat|sun) n=${d^}; [[ " ${out[*]} " == *" $n "* ]] || out+=("$n") ;; *) return 1 ;; esac
+    done
+    (( ${#out[@]} == 7 )) && { echo daily; return 0; }
+    (( ${#out[@]} )) || return 1
+    (IFS=,; echo "${out[*]}")
+}
+
+sched_window() {  # -> SW_START (seconds after midnight) and SW_LEN (seconds) of the daily window
+    local a b
+    case $SCHED_TRIGGER in
+        time)  SW_START=$(sched_hm "$SCHED_TIME") || SW_START=10800
+               SW_LEN=10800 ;;   # 3 h to find a good moment after the set time (busy, on battery…)
+        night) a=$(sched_hm "${SCHED_WINDOW%-*}") || a=3600
+               b=$(sched_hm "${SCHED_WINDOW#*-}") || b=21600
+               SW_START=$a; SW_LEN=$(( (b - a + 86400) % 86400 )); (( SW_LEN == 0 )) && SW_LEN=86400 ;;
+        *)     SW_START=0; SW_LEN=86400 ;;
+    esac
+}
+
+sched_day_allowed() {  # sched_day_allowed EPOCH — is that day one of SCHED_DAYS?
+    [[ $SCHED_DAYS == daily || -z $SCHED_DAYS ]] && return 0
+    local d; d=$(LC_ALL=C date -d "@$1" +%a)
+    [[ ",$SCHED_DAYS," == *",$d,"* ]]
+}
+
+sched_shift_day() {  # sched_shift_day EPOCH N -> the same local clock time N days later (N < 0 = earlier; DST-safe)
+    local d t
+    d=$(date -d "@$1" +%F) && t=$(date -d "@$1" +%T) || return 1
+    d=$(date -d "$d $2 days" +%F) && date -d "$d $t" +%s
+}
+
+sched_last_eff() {  # the last scheduled run, or when the schedule was turned on (a new schedule waits for its first window)
+    local last since
+    last=$(cat "$STATE_DIR/sched_last" 2>/dev/null); [[ $last =~ ^[0-9]+$ ]] || last=0
+    since=$(cat "$STATE_DIR/sched_since" 2>/dev/null); [[ $since =~ ^[0-9]+$ ]] || since=0
+    echo $(( last > since ? last : since ))
+}
+
+sched_state() {  # -> SC_NOW SC_SHIFT SC_INWIN SC_WS (start of the window "now" belongs to) SC_DUEWS SC_DUE SC_THISWIN SC_LAST
+    local mid i t
+    SC_NOW=$(date +%s); sched_window
+    mid=$(date -d "$(date +%F) 00:00" +%s)
+    SC_SHIFT=$(( (SC_NOW - mid - SW_START + 86400) % 86400 ))
+    SC_INWIN=false; (( SC_SHIFT < SW_LEN )) && SC_INWIN=true
+    SC_WS=$(( SC_NOW - SC_SHIFT ))
+    SC_LAST=$(sched_last_eff)
+    SC_DUEWS=0
+    for (( i = 0; i < 8; i++ )); do      # the most recent window on an allowed day (today's, or an earlier one)
+        t=$(sched_shift_day "$SC_WS" "-$i") || break
+        sched_day_allowed "$t" && { SC_DUEWS=$t; break; }
+    done
+    SC_DUE=false; (( SC_DUEWS > 0 && SC_LAST < SC_DUEWS )) && SC_DUE=true
+    SC_THISWIN=false; (( SC_DUEWS == SC_WS )) && SC_THISWIN=true
+}
+
+sched_gui_sessions() {  # -> SC_GUI (desktop sessions of this user), SC_LOCKED, SC_LIDLE (logind idle seconds, 0 = none), SC_X11
+    local sid t v
+    SC_GUI=0 SC_LOCKED=0 SC_LIDLE=0 SC_X11=0
+    while read -r sid; do
+        [[ -n $sid ]] || continue
+        t=$(loginctl show-session "$sid" -p Type --value 2>/dev/null)
+        [[ $t == x11 || $t == wayland || $t == mir ]] || continue
+        [[ $(loginctl show-session "$sid" -p State --value 2>/dev/null) == closing ]] && continue
+        SC_GUI=$(( SC_GUI + 1 )); [[ $t == x11 ]] && SC_X11=1
+        [[ $(loginctl show-session "$sid" -p LockedHint --value 2>/dev/null) == yes ]] && SC_LOCKED=1
+        if [[ $(loginctl show-session "$sid" -p IdleHint --value 2>/dev/null) == yes ]]; then
+            v=$(loginctl show-session "$sid" -p IdleSinceHint --value 2>/dev/null)
+            [[ $v =~ ^[0-9]+$ ]] && (( v > 0 )) && SC_LIDLE=$(( $(date +%s) - v / 1000000 ))
+        fi
+    done < <(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$UID" '$2 == u {print $1}')
+}
+
+sched_idle() {  # -> SC_IDLE (seconds without keyboard/mouse input; -1 = cannot tell) and SC_IDLE_HOW
+    local v now; now=$(date +%s)
+    SC_IDLE=-1 SC_IDLE_HOW="unknown"
+    sched_gui_sessions
+    (( SC_GUI )) || { SC_IDLE=999999 SC_IDLE_HOW="nobody is logged in to a desktop"; return; }
+    (( SC_LOCKED )) && { SC_IDLE=999999 SC_IDLE_HOW="the screen is locked"; return; }
+    if systemctl --user -q is-active "$SCHED_UNIT-idle.service" 2>/dev/null; then   # swayidle (KDE, Sway, Hyprland… on Wayland)
+        if v=$(cat "$IDLE_FILE" 2>/dev/null) && [[ $v =~ ^[0-9]+$ ]]; then SC_IDLE=$(( now - v )); else SC_IDLE=0; fi
+        SC_IDLE_HOW="idle watcher"; return
+    fi
+    if v=$(gdbus call --session --dest org.gnome.Mutter.IdleMonitor --object-path /org/gnome/Mutter/IdleMonitor/Core \
+            --method org.gnome.Mutter.IdleMonitor.GetIdletime 2>/dev/null) && [[ $v =~ ([0-9]+),\) ]]; then
+        SC_IDLE=$(( BASH_REMATCH[1] / 1000 )); SC_IDLE_HOW="GNOME"; return
+    fi
+    if (( SC_X11 )) && have xprintidle && v=$(xprintidle 2>/dev/null) && [[ $v =~ ^[0-9]+$ ]]; then
+        SC_IDLE=$(( v / 1000 )); SC_IDLE_HOW="X11"; return
+    fi
+    (( SC_LIDLE > 0 )) && { SC_IDLE=$SC_LIDLE; SC_IDLE_HOW="logind"; return; }
+    if v=$(gdbus call --session --dest org.freedesktop.ScreenSaver --object-path /ScreenSaver \
+            --method org.freedesktop.ScreenSaver.GetActive 2>/dev/null) && [[ $v == *true* ]]; then
+        SC_IDLE=999999 SC_IDLE_HOW="the screen saver is on"; return
+    fi
+}
+
+sched_idle_inhibited() {  # an app asked the desktop not to go idle (video playing, presentation…) -> prints who
+    systemd-inhibit --list --no-legend --no-pager 2>/dev/null | awk '$0 ~ /idle/ && $NF == "block" && $0 !~ /smart-update/ {print $5; exit}'
+}
+
+sched_on_battery() {
+    local s ac=0 bat=0
+    for s in /sys/class/power_supply/*; do
+        case $(cat "$s/type" 2>/dev/null) in
+            Mains|USB|USB_C|USB_PD) [[ $(cat "$s/online" 2>/dev/null) == 1 ]] && ac=1 ;;
+            Battery) [[ $(cat "$s/scope" 2>/dev/null) == Device ]] || bat=1 ;;   # Device = a mouse/keyboard battery
+        esac
+    done
+    (( bat && ! ac ))
+}
+
+sched_metered() {  # NetworkManager: 1 = yes, 3 = guessed yes (phone hotspot…)
+    have busctl || return 1
+    local m; m=$(busctl get-property org.freedesktop.NetworkManager /org/freedesktop/NetworkManager org.freedesktop.NetworkManager Metered 2>/dev/null) || return 1
+    [[ $m == "u 1" || $m == "u 3" ]]
+}
+
+sched_cpu_busy() {  # 1-minute load above SCHED_MAX_LOAD % of the CPU cores
+    local l n; read -r l _ </proc/loadavg; n=$(nproc 2>/dev/null || echo 1)
+    awk -v l="$l" -v n="$n" -v m="${SCHED_MAX_LOAD:-50}" 'BEGIN { exit !(l * 100 / n > m) }'
+}
+
+sched_ago() {  # sched_ago EPOCH -> "3 h ago"
+    local d=$(( $(date +%s) - $1 ))
+    (( $1 <= 0 )) && { echo "never"; return; }
+    if (( d < 3600 )); then echo "$(( d / 60 )) min ago"; elif (( d < 172800 )); then echo "$(( d / 3600 )) h ago"; else echo "$(( d / 86400 )) days ago"; fi
+}
+
+sched_decide() {  # 0 = start the update now; otherwise SC_WHY says why not
+    SC_WHY="" SC_FORCED=false
+    [[ $SCHED_ENABLED == true ]] || { SC_WHY="the schedule is off"; return 1; }
+    sched_state
+    [[ $SC_DUE == true ]] || { SC_WHY="not due — last run $(sched_ago "$SC_LAST"); next: $(sched_next_text)"; return 1; }
+    local snooze; snooze=$(cat "$STATE_DIR/sched_snooze" 2>/dev/null)
+    [[ $snooze =~ ^[0-9]+$ ]] && (( snooze > SC_NOW )) && { SC_WHY="postponed by you until $(date -d "@$snooze" '+%H:%M')"; return 1; }
+
+    local overdue=true need_idle=true
+    [[ $SC_INWIN == true && $SC_THISWIN == true ]] && overdue=false
+    if [[ $overdue == true && $SCHED_MISSED == next-window && $SC_INWIN != true ]]; then
+        SC_WHY="the $(LC_ALL=C date -d "@$SC_DUEWS" '+%a') run was missed — waiting for the next window"; return 1
+    fi
+    [[ $SCHED_TRIGGER == time && $SC_INWIN == true ]] && need_idle=false   # a fixed time does not wait for idle
+    (( ${SCHED_IDLE_MIN:-0} <= 0 )) && need_idle=false
+
+    if state_read && [[ -n ${S[pid]:-} ]] && session_alive "${S[pid]}"; then SC_WHY="$APP_TITLE is already open (PID ${S[pid]})"; return 1; fi
+    [[ -e ${DB_PATH:-/var/lib/pacman}/db.lck ]] && { SC_WHY="another program is using pacman (lock file present)"; return 1; }
+    [[ $SCHED_AC_ONLY == true ]] && sched_on_battery && { SC_WHY="running on battery"; return 1; }
+    [[ $SCHED_SKIP_METERED == true ]] && sched_metered && { SC_WHY="the connection is metered"; return 1; }
+
+    if [[ $need_idle == true ]]; then
+        local who busy=""
+        sched_idle
+        if (( SC_IDLE < 0 )); then busy="waiting for the screen to lock (this desktop does not report keyboard/mouse idle time — install swayidle or xprintidle from menu → Scheduled updates)"
+        elif (( SC_IDLE < SCHED_IDLE_MIN * 60 )); then busy="you are using the computer (idle for $(( SC_IDLE / 60 )) of $SCHED_IDLE_MIN min, via $SC_IDLE_HOW)"
+        elif (( SC_IDLE < 999999 )) && who=$(sched_idle_inhibited) && [[ -n $who ]]; then busy="$who is keeping the computer awake (video, call…)"
+        elif sched_cpu_busy; then busy="the CPU is busy (load $(cut -d' ' -f1 /proc/loadavg))"
+        fi
+        if [[ -n $busy ]]; then
+            # last minutes of tonight's window and still not idle
+            if [[ $SCHED_TRIGGER == night && $overdue == false ]] && (( SC_SHIFT >= SW_LEN - 600 )); then
+                if [[ $SCHED_WINDOW_END == run ]]; then SC_FORCED=true; sched_log "window ends and the computer was never idle — running anyway (SCHED_WINDOW_END=run)"
+                elif [[ $(cat "$STATE_DIR/sched_told" 2>/dev/null) != "$SC_WS" ]]; then
+                    echo "$SC_WS" >"$STATE_DIR/sched_told"
+                    local nxt="at the next idle moment"; [[ $SCHED_MISSED == next-window ]] && nxt="in the next window"
+                    notify "Scheduled update skipped" "You were using the computer during the update window. It will run $nxt." low
+                    sched_log "window ended without an idle moment — will run $nxt"
+                fi
+            fi
+            [[ $SC_FORCED == true ]] || { SC_WHY=$busy; return 1; }
+        fi
+    fi
+    net_ok || { SC_WHY="no internet connection"; return 1; }
+    return 0
+}
+
+sched_next_text() {  # when the next run will be (assumes sched_state ran)
+    local i t idle=""
+    (( SCHED_IDLE_MIN > 0 )) && [[ $SCHED_TRIGGER != time ]] && idle=", when idle"
+    [[ $SC_DUE == true ]] && { echo "due now — starts as soon as conditions allow"; return; }
+    for (( i = 0; i < 9; i++ )); do
+        t=$(sched_shift_day "$SC_WS" "$i") || break
+        (( t > SC_LAST )) && sched_day_allowed "$t" || continue
+        case $SCHED_TRIGGER in
+            idle) LC_ALL=C date -d "@$t" "+%a %-d %b$idle" ;;
+            *)    LC_ALL=C date -d "@$t" "+%a %-d %b %H:%M$idle" ;;
+        esac
+        return
+    done
+    echo "unknown (check SCHED_DAYS)"
+}
+
+sched_describe() {  # one line: "every Sun, at night 01:00–06:00 when idle 15 min · simple view · full update"
+    local days when view task
+    case $SCHED_DAYS in daily|"") days="every day" ;; Mon,Tue,Wed,Thu,Fri) days="on weekdays" ;; Sat,Sun) days="on weekends" ;; *) days="every ${SCHED_DAYS//,/, }" ;; esac
+    case $SCHED_TRIGGER in
+        time)  when="at $SCHED_TIME" ;;
+        night) when="between ${SCHED_WINDOW%-*} and ${SCHED_WINDOW#*-}"; (( SCHED_IDLE_MIN > 0 )) && when+=" when idle ${SCHED_IDLE_MIN} min" ;;
+        *)     when="whenever the computer is idle ${SCHED_IDLE_MIN} min" ;;
+    esac
+    [[ $SCHED_VIEW == detailed ]] && view="detailed view (you answer)" || view="simple view (automatic)"
+    case $SCHED_TASK in official) task="official packages only" ;; download) task="download only" ;; *) task="full update" ;; esac
+    printf '%s, %s · %s · %s' "$days" "$when" "$view" "$task"
+}
+
+sched_status_line() {  # for the main menu
+    [[ $SCHED_ENABLED == true ]] || { echo "Schedule: off"; return; }
+    sched_state
+    printf 'Schedule: %s · next: %s' "$(sched_describe)" "$(sched_next_text)"
+}
+
+sched_status_text() {
+    local res r_ep r_st r_tx
+    if [[ $SCHED_ENABLED != true ]]; then echo "Scheduled updates are OFF."
+    else
+        sched_state
+        echo "Scheduled updates are ON: $(sched_describe)"
+        echo "Next run:  $(sched_next_text)"
+    fi
+    res=$(cat "$STATE_DIR/sched_result" 2>/dev/null)
+    if [[ -n $res ]]; then IFS='|' read -r r_ep r_st r_tx <<<"$res"; echo "Last run:  $(LC_ALL=C date -d "@$r_ep" '+%a %-d %b %H:%M') — $r_st${r_tx:+ ($r_tx)}"
+    else echo "Last run:  never"; fi
+    local cond=()
+    [[ $SCHED_AC_ONLY == true ]] && cond+=("on AC power")
+    [[ $SCHED_SKIP_METERED == true ]] && cond+=("not on a metered connection")
+    (( ${#cond[@]} )) && echo "Only when: $(IFS=,; echo "${cond[*]}" | sed 's/,/, /g')"
+    if [[ $SCHED_ENABLED == true ]]; then
+        systemctl --user -q is-active "$SCHED_UNIT.timer" 2>/dev/null || echo "⚠ The timer is not active — turn the schedule off and on again (or: $PROG --schedule on)."
+        [[ $(loginctl show-user "$USER" -p Linger --value 2>/dev/null) == yes ]] || echo "Note: runs only while you are logged in (turn on 'Run while logged out' to change that)."
+    fi
+}
+
+sched_watcher_needed() {  # keyboard/mouse idle time on Wayland desktops other than GNOME needs swayidle
+    [[ $SCHED_TRIGGER != time && ${SCHED_IDLE_MIN:-0} -gt 0 ]] || return 1
+    [[ ${XDG_SESSION_TYPE:-} == wayland || -n ${WAYLAND_DISPLAY:-} ]] || return 1
+    [[ ${XDG_CURRENT_DESKTOP:-} != *GNOME* ]]
+}
+
+sched_write_units() {
+    mkdir -p "$SCHED_UNIT_DIR"
+    local cal=() a b sh eh
+    case $SCHED_TRIGGER in
+        time)  cal=("*-*-* $SCHED_TIME:00" "*:0/15") ;;
+        night) if [[ $SCHED_MISSED == next-window ]]; then     # nothing to do outside the window: tick only inside it
+                   a=$(sched_hm "${SCHED_WINDOW%-*}"); b=$(sched_hm "${SCHED_WINDOW#*-}")
+                   sh=$(( a / 3600 )); eh=$(( (b + 3599) / 3600 % 24 ))
+                   if (( a < b )); then cal=("*-*-* $(printf '%02d..%02d' "$sh" "$eh"):0/5:00")
+                   else cal=("*-*-* $(printf '%02d' "$sh")..23:0/5:00" "*-*-* 00..$(printf '%02d' "$eh"):0/5:00"); fi
+               else cal=("*:0/5"); fi ;;
+        *)     cal=("*:0/5") ;;
+    esac
+    cat >"$SCHED_UNIT_DIR/$SCHED_UNIT.service" <<EOF
+# Written by $APP_TITLE — change it from the menu (Scheduled updates), not here
+[Unit]
+Description=$APP_TITLE — scheduled update check
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bash "$SELF" --scheduled
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=infinity
+# the checks every few minutes stay out of the journal; the schedule has its own log: $SCHED_LOG
+LogLevelMax=notice
+EOF
+    {
+        echo "# Written by $APP_TITLE — $(sched_describe)"
+        echo "[Unit]"
+        echo "Description=$APP_TITLE — schedule ($(sched_describe))"
+        echo
+        echo "[Timer]"
+        printf 'OnCalendar=%s\n' "${cal[@]}"
+        echo "Persistent=true"
+        echo "AccuracySec=30s"
+        echo "Unit=$SCHED_UNIT.service"
+        echo
+        echo "[Install]"
+        echo "WantedBy=timers.target"
+    } >"$SCHED_UNIT_DIR/$SCHED_UNIT.timer"
+    if sched_watcher_needed && have swayidle; then
+        cat >"$SCHED_UNIT_DIR/$SCHED_UNIT-idle.service" <<EOF
+# Written by $APP_TITLE — tells the schedule when you are away from the keyboard
+[Unit]
+Description=$APP_TITLE — idle watcher
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/swayidle -w timeout 60 '/usr/bin/bash "$SELF" --idle-mark idle' resume '/usr/bin/bash "$SELF" --idle-mark active'
+ExecStopPost=/usr/bin/rm -f $IDLE_FILE
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+    fi
+}
+
+sched_apply() {  # write the settings and (re)install or remove the timer
+    local k
+    for k in SCHED_ENABLED SCHED_TRIGGER SCHED_DAYS SCHED_TIME SCHED_WINDOW SCHED_IDLE_MIN SCHED_VIEW SCHED_TASK \
+             SCHED_MISSED SCHED_WINDOW_END SCHED_AC_ONLY SCHED_SKIP_METERED SCHED_MAX_LOAD; do
+        set_config_value "$k" "${!k}"
+    done
+    have systemctl || { log_error "systemctl not found — the schedule needs systemd"; return 1; }
+    if [[ $SCHED_ENABLED == true ]]; then
+        [[ -s $STATE_DIR/sched_since ]] || { mkdir -p "$STATE_DIR"; date +%s >"$STATE_DIR/sched_since"; }
+        sched_write_units
+        systemctl --user daemon-reload
+        systemctl --user enable --now "$SCHED_UNIT.timer" >/dev/null 2>&1 \
+            || { log_error "Could not start the timer: systemctl --user enable --now $SCHED_UNIT.timer"; return 1; }
+        if [[ -f $SCHED_UNIT_DIR/$SCHED_UNIT-idle.service ]] && sched_watcher_needed && have swayidle; then
+            systemctl --user enable "$SCHED_UNIT-idle.service" >/dev/null 2>&1
+            systemctl --user restart "$SCHED_UNIT-idle.service" >/dev/null 2>&1
+        else
+            systemctl --user disable --now "$SCHED_UNIT-idle.service" >/dev/null 2>&1
+            rm -f "$SCHED_UNIT_DIR/$SCHED_UNIT-idle.service"
+        fi
+        systemctl --user daemon-reload
+        sched_log "schedule saved: $(sched_describe)"
+        log_success "Schedule active: $(sched_describe)"
+    else
+        systemctl --user disable --now "$SCHED_UNIT.timer" "$SCHED_UNIT-idle.service" >/dev/null 2>&1
+        rm -f "$SCHED_UNIT_DIR/$SCHED_UNIT".{timer,service} "$SCHED_UNIT_DIR/$SCHED_UNIT-idle.service" "$STATE_DIR/sched_since"
+        systemctl --user daemon-reload 2>/dev/null
+        sched_log "schedule turned off"
+        log_success "Scheduled updates are off (timer removed)"
+    fi
+}
+
+sched_open_terminal() {  # run this script in a new terminal window and wait until it is closed
+    local t cmd=(/usr/bin/bash "$SELF" "$@") list=()
+    export SMART_UPDATE_IN_TERM=1
+    [[ -n ${TERMINAL:-} ]] && list+=("${TERMINAL%% *}")
+    [[ ${XDG_CURRENT_DESKTOP:-} == *KDE* ]] && list+=(konsole)
+    [[ ${XDG_CURRENT_DESKTOP:-} == *GNOME* ]] && list+=(kgx gnome-terminal)
+    list+=(konsole gnome-terminal kgx xfce4-terminal kitty alacritty foot wezterm xterm)
+    for t in "${list[@]}"; do
+        have "$t" || continue
+        sched_log "opening $t for the detailed update"
+        case $t in
+            gnome-terminal) gnome-terminal --wait -- "${cmd[@]}" ;;
+            kgx)            kgx -- "${cmd[@]}" ;;
+            xfce4-terminal) xfce4-terminal --disable-server -x "${cmd[@]}" ;;
+            wezterm)        wezterm start --always-new-process -- "${cmd[@]}" ;;
+            kitty|foot)     "$t" "${cmd[@]}" ;;
+            *)              "$t" -e "${cmd[@]}" ;;
+        esac
+        return 0
+    done
+    return 1
+}
+
+sched_check() {  # --scheduled: the timer calls this every few minutes
+    mkdir -p "$STATE_DIR"
+    if ! sched_decide; then sched_note "$SC_WHY"; return 0; fi
+    rm -f "$STATE_DIR/sched_note"
+    local args=(--run --scheduled-run)
+    case $SCHED_TASK in
+        official) args+=(--no-aur --no-flatpak --no-snap --no-firmware) ;;
+        download) args+=(--download-only) ;;
+    esac
+    if [[ $SCHED_TEST == true ]]; then
+        echo "  ✔ Now is a good moment — the timer would start: $PROG ${args[*]} $([[ $SCHED_VIEW == detailed ]] && echo "--detailed (in a terminal window)" || echo "--cli --auto (in the background)")"
+        return 0
+    fi
+    if [[ $SCHED_VIEW == detailed ]]; then
+        sched_gui_sessions
+        if (( SC_GUI == 0 )) || [[ -z ${WAYLAND_DISPLAY:-}${DISPLAY:-} ]]; then
+            sched_note "the detailed view needs you logged in to a desktop (it opens a terminal window)"; return 0
+        fi
+        sched_log "starting a detailed update (terminal window, you answer the questions)"
+        notify "Scheduled update" "A terminal window opened — the update waits for you there" normal
+        sched_open_terminal "${args[@]}" --detailed && return 0
+        sched_log "no terminal emulator found — running it in the simple view instead"
+    fi
+    if ! sudo -n true 2>/dev/null; then
+        sched_gui_sessions
+        if (( SC_GUI )) && [[ -n ${WAYLAND_DISPLAY:-}${DISPLAY:-} ]] && detect_gui_tool; then
+            export SMART_UPDATE_ASKPASS=1
+            sched_log "sudo needs your password — asking in a dialog (gives up after 5 min)"
+        else
+            sched_note "sudo needs a password and nobody is there to type it — allow passwordless updates or use the detailed view (menu → Scheduled updates)"
+            return 0
+        fi
+    fi
+    sched_log "starting an automatic update ($SCHED_TASK)"
+    exec /usr/bin/bash "$SELF" "${args[@]}" --cli --auto
+}
+
+sched_record() {  # sched_record started | result RC [text]
+    mkdir -p "$STATE_DIR"
+    case $1 in
+        started) date +%s >"$STATE_DIR/sched_last"; rm -f "$STATE_DIR/sched_snooze" "$STATE_DIR/sched_note" ;;
+        result)  local st=ok; (( $2 != 0 )) && st="needs attention"
+                 printf '%s|%s|%s\n' "$(date +%s)" "${4:-$st}" "${3:-}" >"$STATE_DIR/sched_result"
+                 sched_log "finished: ${4:-$st}${3:+ — $3}" ;;
+    esac
+}
+
+sched_start_prompt() {  # detailed scheduled run, in its terminal: 0 = start, 1 = postpone, 2 = skip this time
+    local n=${SCHED_COUNTDOWN:-90} k=""
+    printf '\n  %s⏰ Scheduled update%s  %s%s%s\n' "$BOLD$PURPLE" "$NC" "$GRAY" "$(sched_describe)" "$NC"
+    printf '  [Enter] start now   [p] postpone 1 hour   [s] skip this time\n'
+    printf '  %sIt starts by itself when the countdown ends; it will still stop and wait at every question.%s\n' "$GRAY" "$NC"
+    while (( n > 0 )); do
+        printf '\r  Starting in %3d s… ' "$n"
+        if read -rsn1 -t 1 k </dev/tty; then break; fi
+        n=$(( n - 1 ))
+    done
+    echo
+    case $k in
+        p|P) echo $(( $(date +%s) + 3600 )) >"$STATE_DIR/sched_snooze"; log_info "Postponed — it will ask again in about an hour"; return 1 ;;
+        s|S) return 2 ;;
+    esac
+    return 0
+}
+
+detail_plan() {  # detailed view: what this run is going to do, before anything changes
+    local list n h
+    printf '\n%s━━ What this update will do ━━%s\n' "$BOLD$PURPLE" "$NC"
+    if [[ $DO_OFFICIAL == true ]]; then
+        if have checkupdates; then
+            list=$(CHECKUPDATES_DB="$TMP/checkup-db" checkupdates 2>/dev/null); n=$(grep -c . <<<"$list")
+            printf '  📦 Official packages: %s update(s)\n' "$n"
+            head -n 20 <<<"$list" | sed '/^$/d; s/^/       /'; (( n > 20 )) && echo "       … and $(( n - 20 )) more"
+        else echo "  📦 Official packages: pacman lists them and asks before installing"; fi
+        [[ $DOWNLOAD_ONLY == true ]] && echo "       (download only — nothing is installed this time)"
+    fi
+    if [[ $DO_AUR == true && $DOWNLOAD_ONLY != true ]]; then
+        h=$(find_aur_helper)
+        if [[ $h != none && $h != pamac ]]; then
+            list=$(timeout 60 "$h" -Qua 2>/dev/null); n=$(grep -c . <<<"$list")
+            printf '  🧩 AUR packages (%s): %s update(s)\n' "$h" "$n"; head -n 10 <<<"$list" | sed '/^$/d; s/^/       /'
+        else echo "  🧩 AUR packages: ${h/none/no AUR helper installed}"; fi
+    fi
+    if [[ $DO_FLATPAK == true ]] && have flatpak; then
+        printf '  📱 Flatpak apps: %s update(s)\n' "$(timeout 60 flatpak remote-ls --updates 2>/dev/null | grep -c .)"; fi
+    if [[ $DO_SNAP == true ]] && have snap; then
+        printf '  📱 Snap packages: %s update(s)\n' "$(timeout 60 snap refresh --list 2>/dev/null | awk 'NR > 1' | grep -c .)"; fi
+    [[ $DO_FIRMWARE == true ]] && have fwupdmgr && echo "  🔌 Firmware: checked for updates (never flashed by this script)"
+    [[ $DO_CLEANUP == true && $DOWNLOAD_ONLY != true ]] && echo "  🧹 Cleanup: orphaned packages (asks first), old cached packages (keeps $PACCACHE_KEEP), journal"
+    printf '\n  %sYou are in control:%s pacman, the AUR helper and Flatpak show their own questions\n' "$BOLD" "$NC"
+    printf '  (provider choice, replacements, PKGBUILD review, "Proceed?"); every repair is explained\n'
+    printf '  and asked first ([d] shows the exact commands); before each optional step you can skip it.\n'
+    printf '  Full command output is shown. %s = emergency stop.\n\n' "$STOP_KEY_LABEL"
+}
+
+step_gate() {  # detailed view: ask before an optional step. 0 = run it
+    [[ $INTERACTIVE_ALL == true && -t 0 && $DRY_RUN != true ]] || return 0
+    if [[ ${GATE_STOP:-false} == true ]]; then (( PHASE_CUR >= 0 )) && PHASE_STATE[PHASE_CUR]=skip; return 1; fi
+    local k=""
+    printf '\n%s━━ Next: %s ━━%s  %s[Enter] run it · [s] skip · [q] skip everything that is left%s ' "$BOLD$CYAN" "$1" "$NC" "$GRAY" "$NC"
+    read -rsn1 k </dev/tty; echo
+    case $k in
+        s|S) log_info "Skipped by you: $1"; (( PHASE_CUR >= 0 )) && PHASE_STATE[PHASE_CUR]=skip; return 1 ;;
+        q|Q) GATE_STOP=true; log_info "Skipping the remaining steps"; (( PHASE_CUR >= 0 )) && PHASE_STATE[PHASE_CUR]=skip; return 1 ;;
+    esac
+    return 0
+}
+
+sched_idle_helper() {  # make keyboard/mouse idle time readable on this desktop
+    sched_watcher_needed || { have xprintidle || [[ ${XDG_SESSION_TYPE:-} != x11 ]] || deps_install xprintidle; return 0; }
+    have swayidle && return 0
+    log_info "On ${XDG_CURRENT_DESKTOP:-this desktop} (Wayland) the idle time is read with 'swayidle' (small, from the official repos; it works with KDE Plasma, Sway, Hyprland…)."
+    ui_ask "Install swayidle so the schedule knows when you are away?" y && deps_install swayidle
+    have swayidle || log_warning "Without it, 'idle' means: the screen is locked"
+}
+
+sched_sudo_setup() {  # simple view needs sudo without a password prompt
+    if sudo -n true 2>/dev/null; then log_success "sudo already works without a password — automatic updates can run unattended"; return 0; fi
+    local f=/etc/sudoers.d/90-arch-smart-update
+    ui_dialog "Passwordless sudo" "Automatic (simple view) updates run while nobody is at the keyboard, so sudo cannot ask for your password.
+
+Options:
+ • Allow passwordless sudo for your account ($f). Simple and reliable, but any program running as you can then become root without a password — only do this on a personal computer.
+ • Keep the password: when the update starts and you are logged in, a password dialog appears (it gives up after 5 minutes and tries again later).
+ • Use the detailed view instead: a terminal opens and asks you." 1 1 "Allow passwordless sudo" "Keep the password" || return 0
+    (( TUI_CHOICE == 0 )) || { log_info "Keeping the password prompt"; return 0; }
+    local tmpf="$TMP/sudoers"
+    printf '# Added by %s for unattended scheduled updates — remove this file to undo\n%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$APP_TITLE" "$USER" >"$tmpf"
+    if sudo visudo -cf "$tmpf" >/dev/null && sudo install -m 0440 -o root -g root "$tmpf" "$f"; then
+        log_success "Added $f (undo: sudo rm $f)"
+    else log_error "Could not add $f — nothing was changed"; fi
+}
+
+action_schedule() {
+    local s v onoff
+    onoff() { [[ $1 == true ]] && echo on || echo off; }
+    while :; do
+        s=$(ui_choose "Scheduled updates" "$(sched_status_text)" \
+            toggle  "$([[ $SCHED_ENABLED == true ]] && echo "⏹  Turn scheduled updates OFF" || echo "▶  Turn scheduled updates ON (quick setup)")" \
+            when    "🕒 When: $(case $SCHED_TRIGGER in night) echo "late at night, $SCHED_WINDOW, when idle" ;; idle) echo "any time the computer is idle" ;; *) echo "at a fixed time, $SCHED_TIME" ;; esac)" \
+            days    "📅 How often: $(case $SCHED_DAYS in daily|"") echo daily ;; *) echo "on ${SCHED_DAYS//,/, }" ;; esac)" \
+            idle    "💤 Idle means: no keyboard/mouse for $SCHED_IDLE_MIN min and CPU below $SCHED_MAX_LOAD %" \
+            view    "👁  View: $([[ $SCHED_VIEW == detailed ]] && echo "detailed — terminal opens, you see everything and answer every question" || echo "simple — automatic in the background, notifications only")" \
+            task    "📦 What: $(case $SCHED_TASK in official) echo "official packages only" ;; download) echo "download only (install later yourself)" ;; *) echo "full smart update" ;; esac)" \
+            missed  "↩  If a run is missed (computer off / busy): $([[ $SCHED_MISSED == next-window ]] && echo "wait for the next window" || echo "run at the next idle moment")" \
+            wend    "🌙 Never idle during the night window: $([[ $SCHED_WINDOW_END == run ]] && echo "run anyway at its end" || echo "skip and tell me")" \
+            power   "🔌 Only on AC power: $(onoff "$SCHED_AC_ONLY")" \
+            metered "📶 Skip on metered connections: $(onoff "$SCHED_SKIP_METERED")" \
+            linger  "🔒 Run while logged out: $([[ $(loginctl show-user "$USER" -p Linger --value 2>/dev/null) == yes ]] && echo on || echo off)" \
+            sudo    "🔑 Unattended sudo (needed by the simple view)" \
+            test    "🧪 Check now: would it run at this moment, and why (or why not)?" \
+            log     "📜 Schedule log" \
+            back    "← Back") || return 0
+        case $s in
+            toggle)
+                if [[ $SCHED_ENABLED == true ]]; then SCHED_ENABLED=false; sched_apply; pause; continue; fi
+                sched_pick_when || continue
+                sched_pick_days || continue
+                sched_pick_view || continue
+                SCHED_ENABLED=true
+                [[ $SCHED_VIEW == simple ]] && sched_sudo_setup
+                [[ $SCHED_TRIGGER != time ]] && sched_idle_helper
+                sched_apply; pause; continue ;;
+            when)   sched_pick_when || continue ;;
+            days)   sched_pick_days || continue ;;
+            idle)   ui_input "Idle" "Minutes without keyboard/mouse input that count as idle (0 = do not wait for idle):" "$SCHED_IDLE_MIN" \
+                        && [[ $TUI_INPUT =~ ^[0-9]+$ ]] && SCHED_IDLE_MIN=$TUI_INPUT
+                    ui_input "Idle" "Highest CPU load (% of all cores) that still counts as idle:" "$SCHED_MAX_LOAD" \
+                        && [[ $TUI_INPUT =~ ^[0-9]+$ ]] && SCHED_MAX_LOAD=$TUI_INPUT ;;
+            view)   sched_pick_view || continue; [[ $SCHED_VIEW == simple && $SCHED_ENABLED == true ]] && sched_sudo_setup ;;
+            task)   v=$(ui_choose "What to do" "What should a scheduled run do?" \
+                        full "🚀 Full smart update (official + AUR + apps + cleanup, as in Settings)" \
+                        official "📦 Official packages only" \
+                        download "⬇️  Download only — install later yourself (nothing changes on the system)") && SCHED_TASK=$v ;;
+            missed) [[ $SCHED_MISSED == next-window ]] && SCHED_MISSED=next-idle || SCHED_MISSED=next-window ;;
+            wend)   [[ $SCHED_WINDOW_END == run ]] && SCHED_WINDOW_END=skip || SCHED_WINDOW_END=run ;;
+            power)  [[ $SCHED_AC_ONLY == true ]] && SCHED_AC_ONLY=false || SCHED_AC_ONLY=true ;;
+            metered) [[ $SCHED_SKIP_METERED == true ]] && SCHED_SKIP_METERED=false || SCHED_SKIP_METERED=true ;;
+            linger) if [[ $(loginctl show-user "$USER" -p Linger --value 2>/dev/null) == yes ]]; then
+                        loginctl disable-linger "$USER" && log_success "Scheduled updates now run only while you are logged in"
+                    else
+                        log_info "Keeps your user services running after you log out, so a night update also happens on the login screen (simple view only)."
+                        loginctl enable-linger "$USER" 2>/dev/null || sudo loginctl enable-linger "$USER"
+                        [[ $(loginctl show-user "$USER" -p Linger --value 2>/dev/null) == yes ]] && log_success "Scheduled updates also run while you are logged out"
+                    fi; pause; continue ;;
+            sudo)   sched_sudo_setup; pause; continue ;;
+            test)   screen_fresh; printf '\n%s🧪 Schedule check at %s%s\n' "$BOLD" "$(date '+%a %H:%M')" "$NC"
+                    ( SCHED_VERBOSE=true SCHED_TEST=true; sched_check
+                      sched_idle; printf '  Idle: %s\n' "$( (( SC_IDLE < 0 )) && echo "cannot tell" || { (( SC_IDLE >= 999999 )) && echo "yes ($SC_IDLE_HOW)" || echo "$(( SC_IDLE / 60 )) min $(( SC_IDLE % 60 )) s ($SC_IDLE_HOW)"; })"
+                      printf '  Power: %s · Metered: %s · Load: %s\n' "$(sched_on_battery && echo battery || echo AC)" "$(sched_metered && echo yes || echo no)" "$(cut -d' ' -f1-3 /proc/loadavg)"
+                      systemctl --user list-timers "$SCHED_UNIT.timer" --no-pager 2>/dev/null | head -2 | sed 's/^/  /' ); pause; continue ;;
+            log)    if [[ -s $SCHED_LOG ]]; then if have less; then less +G "$SCHED_LOG"; else tail -n 60 "$SCHED_LOG"; pause; fi
+                    else log_info "Nothing logged yet"; pause; fi; continue ;;
+            back|"") return 0 ;;
+        esac
+        [[ $SCHED_ENABLED == true ]] && sched_apply >/dev/null
+    done
+}
+
+sched_pick_when() {
+    local v t
+    v=$(ui_choose "When" "When should updates run?" \
+        night "🌙 Late at night, while the computer is idle (choose the hours)" \
+        idle  "💤 Any time the computer is idle (no keyboard/mouse, CPU quiet)" \
+        time  "🕒 At a fixed time") || return 1
+    SCHED_TRIGGER=$v
+    case $v in
+        night) while ui_input "Night window" "Between which hours? (HH:MM-HH:MM, may cross midnight, e.g. 23:30-06:00)" "$SCHED_WINDOW"; do
+                   t=${TUI_INPUT// /}
+                   sched_hm "${t%-*}" >/dev/null && sched_hm "${t#*-}" >/dev/null && [[ $t == *-* ]] && { SCHED_WINDOW=$t; break; }
+                   log_warning "Use the form 01:00-06:00"
+               done ;;
+        time)  while ui_input "Time" "At what time? (HH:MM, 24 h)" "$SCHED_TIME"; do
+                   t=${TUI_INPUT// /}; sched_hm "$t" >/dev/null && { SCHED_TIME=$t; break; }
+                   log_warning "Use the form 03:00"
+               done ;;
+    esac
+    return 0
+}
+
+sched_pick_days() {
+    local v d
+    v=$(ui_choose "How often" "On which days?" \
+        daily    "Every day" \
+        weekly   "Once a week (pick the day)" \
+        weekdays "Weekdays (Mon–Fri)" \
+        weekend  "Weekends (Sat, Sun)" \
+        custom   "Choose days (e.g. Mon,Thu)") || return 1
+    case $v in
+        daily|weekdays|weekend) SCHED_DAYS=$(sched_norm_days "$v") ;;
+        weekly) d=$(ui_choose "Day" "Which day?" Mon Monday Tue Tuesday Wed Wednesday Thu Thursday Fri Friday Sat Saturday Sun Sunday) || return 1
+                SCHED_DAYS=$d ;;
+        custom) while ui_input "Days" "Days, comma separated (Mon,Tue,Wed,Thu,Fri,Sat,Sun):" "${SCHED_DAYS/daily/}"; do
+                    d=$(sched_norm_days "$TUI_INPUT") && { SCHED_DAYS=$d; break; }
+                    log_warning "Use day names like Mon,Thu"
+                done ;;
+    esac
+    return 0
+}
+
+sched_pick_view() {
+    local v
+    v=$(ui_choose "View" "How should a scheduled update run?" \
+        simple   "🤖 Simple — fully automatic in the background; safe fixes applied; a notification at the end" \
+        detailed "🔍 Detailed — a terminal window opens: full output, a plan first, you answer pacman/AUR questions and confirm every fix and step") || return 1
+    SCHED_VIEW=$v
+}
+
+sched_cli() {  # --schedule [status|on|off|test|menu]
+    case ${1:-menu} in
+        status) sched_status_text ;;
+        on)     SCHED_ENABLED=true; sched_apply ;;
+        off)    SCHED_ENABLED=false; sched_apply ;;
+        test)   SCHED_VERBOSE=true SCHED_TEST=true; sched_check ;;
+        log)    cat "$SCHED_LOG" 2>/dev/null ;;
+        *)      action_schedule ;;
+    esac
+}
+
 create_config() {
     if [[ -f $CONFIG_FILE ]]; then echo "Config already exists: $CONFIG_FILE"; return; fi
     mkdir -p "$(dirname "$CONFIG_FILE")"
@@ -6236,6 +7217,20 @@ DO_SNAP=true
 DO_FIRMWARE=true
 DO_CLEANUP=true
 DO_HEALTH=true
+# Scheduled updates — easiest to change from the menu (⏰ Scheduled updates), which also installs the timer
+SCHED_ENABLED=false
+SCHED_TRIGGER="night"      # night|idle|time
+SCHED_DAYS="daily"         # daily | Sun | Sat,Sun | Mon,Wed,Fri
+SCHED_TIME="03:00"
+SCHED_WINDOW="01:00-06:00"
+SCHED_IDLE_MIN=15
+SCHED_MAX_LOAD=50
+SCHED_VIEW="simple"        # simple|detailed
+SCHED_TASK="full"          # full|official|download
+SCHED_MISSED="next-idle"   # next-idle|next-window
+SCHED_WINDOW_END="skip"    # skip|run
+SCHED_AC_ONLY=true
+SCHED_SKIP_METERED=true
 EOF
     echo "Created $CONFIG_FILE"
 }
@@ -6287,6 +7282,18 @@ Interface
   --gui                Dialogs + graphical progress (zenity/yad/kdialog), opens a terminal if needed
   --cli                Terminal only
   --no-notify          No desktop notifications
+  --detailed           Detailed view: full output, a plan first, you answer pacman/AUR/Flatpak questions
+                       yourself, every fix is asked, and you can skip each optional step
+  --simple             Simple view: status panel, condensed output (default)
+
+Scheduled updates (systemd user timer; nothing runs unless you turn it on)
+  --schedule           Open the schedule screen: when (late night while idle / any idle moment / fixed
+                       time), how often (daily, weekly, chosen days), simple or detailed view, what to run,
+                       AC power / metered connection rules
+  --schedule status|on|off|test|log
+                       Show the schedule · turn it on/off with the saved settings · check whether it would
+                       run right now and why · show its log
+  --scheduled          What the timer runs every few minutes (checks the conditions, then starts)
 
 Other
   --setup              Check what the script needs, explain it, and install what is missing
@@ -6336,6 +7343,15 @@ parse_args() {
             --no-cleanup)  DO_CLEANUP=false ;;
             --no-health)   DO_HEALTH=false ;;
             --diagnose)    DIAGNOSE_FILE=${2:?--diagnose needs a log file}; shift ;;
+            --detailed)    INTERACTIVE_ALL=true; FIX_MODE=ask; UPDATE_VIEW=classic ;;
+            --simple)      INTERACTIVE_ALL=false; UPDATE_VIEW=panel ;;
+            --schedule)    SCHED_CMD=menu; [[ -n ${2:-} && ${2:-} != -* ]] && { SCHED_CMD=$2; shift; } ;;
+            --scheduled)   SCHED_CHECK=true ;;
+            --scheduled-run) SCHEDULED_RUN=true ;;
+            --idle-mark)   # called by the swayidle watcher: remember since when the user is away
+                           mkdir -p "${IDLE_FILE%/*}"
+                           if [[ ${2:-} == idle ]]; then echo $(( $(date +%s) - 60 )) >"$IDLE_FILE"; else rm -f "$IDLE_FILE"; fi
+                           exit 0 ;;
             --menu|-i)     MENU_REQUESTED=true ;;
             --run)         MENU_REQUESTED=false ;;
             --download-only) DOWNLOAD_ONLY=true; DO_AUR=false; DO_CLEANUP=false ;;
@@ -6389,6 +7405,9 @@ init_runtime() {
 main() {
     parse_args "$@"
 
+    if [[ $SCHED_CHECK == true ]]; then sched_check; exit 0; fi
+    if [[ -n $SCHED_CMD && $SCHED_CMD != menu ]]; then sched_cli "$SCHED_CMD"; exit $?; fi
+
     if [[ -n ${DIAGNOSE_FILE:-} ]]; then
         TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
         CACHE_DIRS=(/var/cache/pacman/pkg); CACHE_DIR=${CACHE_DIRS[0]}
@@ -6423,6 +7442,10 @@ main() {
     init_runtime
     state_write
     [[ $GUI == true && ! -t 0 ]] && setup_askpass
+    if [[ -n ${SMART_UPDATE_ASKPASS:-} ]] && ! sudo -n true 2>/dev/null && detect_gui_tool; then
+        ASKPASS_TIMEOUT=300 setup_askpass     # scheduled run, you are logged in: password dialog, gives up after 5 min
+    fi
+    if [[ $SCHED_CMD == menu ]]; then action_schedule; return 0; fi
     have pacman || { echo "pacman not found — Arch Smart Update is for Arch Linux and Arch-based systems." >&2; exit 1; }
     [[ ${REPORT_ONLY:-} == true ]] || deps_check "${SETUP_REQUESTED:+setup}"
     [[ ${SETUP_REQUESTED:-} == true ]] && return 0
@@ -6439,9 +7462,27 @@ main() {
         interactive_menu
         return 0
     fi
+    if [[ $SCHEDULED_RUN == true ]]; then
+        if [[ $INTERACTIVE_ALL == true && -t 0 ]]; then
+            sched_start_prompt; case $? in
+                1) return 0 ;;
+                2) sched_record started; sched_record result 0 "" "skipped by you"; return 0 ;;
+            esac
+            detail_plan
+        fi
+        sched_record started
+        notify "Scheduled update started" "$(sched_describe)" low
+    elif [[ $INTERACTIVE_ALL == true && -t 0 ]]; then
+        detail_plan
+        ui_ask "Start the update?" y || return 0
+    fi
     gui_choose_tasks
     run_update
     local rc=$?
+    if [[ $SCHEDULED_RUN == true ]]; then
+        local why=""; (( ${#UNRESOLVED[@]} )) && why="${#UNRESOLVED[@]} unresolved: ${UNRESOLVED[0]}"
+        sched_record result "$rc" "$why"
+    fi
     if [[ -n ${SMART_UPDATE_IN_TERM:-} && -t 0 ]]; then read -r -p "Press Enter to close…" _; fi
     return "$rc"
 }
@@ -6460,6 +7501,8 @@ run_update() {
     printf '\n  %s◆ %s%s  %sv%s%s\n' "$PURPLE$BOLD" "$APP_TITLE" "$NC" "$GRAY" "$VERSION" "$NC"
     printf '  %s%s  ·  fixes: %s  ·  Ctrl+C skips a step  ·  %s stops%s\n' "$GRAY" "$(date '+%a %-d %b, %H:%M')" "$FIX_MODE" "$STOP_KEY_LABEL" "$NC"
     [[ $DRY_RUN == true ]] && printf '  %sPreview only — nothing will be changed%s\n' "$YELLOW" "$NC"
+    [[ $INTERACTIVE_ALL == true ]] && printf '  %sDetailed view — full output; you answer every question and can skip steps%s\n' "$CYAN" "$NC"
+    [[ $SCHEDULED_RUN == true ]] && printf '  %sStarted by the schedule: %s%s\n' "$GRAY" "$(sched_describe)" "$NC"
 
     phase_begin pre
     preflight
@@ -6473,7 +7516,7 @@ run_update() {
     fi
     if [[ $DO_AUR == true && $DOWNLOAD_ONLY != true ]]; then
         phase_begin aur
-        if [[ $sys_ok == true ]]; then update_aur
+        if [[ $sys_ok == true ]]; then step_gate "AUR packages" && update_aur
         else
             log_warning "Skipping AUR updates because the official update did not finish (AUR builds on a half-updated system cause partial upgrades)"
             PHASE_STATE[PHASE_CUR]=skip
@@ -6488,13 +7531,13 @@ run_update() {
         check_boot_images
     fi
     [[ $DO_FLATPAK == true || $DO_SNAP == true ]] && phase_begin apps
-    [[ $DO_FLATPAK == true ]] && update_flatpak
-    [[ $DO_SNAP == true ]] && update_snap
+    [[ $DO_FLATPAK == true ]] && { ! have flatpak || step_gate "Flatpak apps"; } && update_flatpak
+    [[ $DO_SNAP == true ]] && { ! have snap || step_gate "Snap packages"; } && update_snap
     phase_begin maint
-    [[ $DO_FIRMWARE == true ]] && check_firmware
+    [[ $DO_FIRMWARE == true ]] && { ! have fwupdmgr || step_gate "Firmware check"; } && check_firmware
 
     post_maintenance
-    [[ $DO_CLEANUP == true && $sys_ok == true ]] && cleanup
+    [[ $DO_CLEANUP == true && $sys_ok == true ]] && step_gate "Cleanup (orphans, package cache, journal)" && cleanup
     phase_begin done
     [[ $DO_HEALTH == true ]] && health_report
     reboot_check

@@ -4,12 +4,16 @@
 
 **One command to update Arch Linux — and fix what goes wrong along the way.**
 
-Official packages, AUR, Flatpak and Snap in the right order, a clean live view while it works,
-and a plain-language explanation (plus a one-click fix) when something fails.
+A free, self-repairing **Arch Linux updater** (Bash script): **pacman**, **AUR** (paru / yay),
+**Flatpak** and **Snap** in the right order, a clean live view while it works, and a plain-language
+explanation, plus a one-click fix, when something fails: keyring and PGP signature errors, mirrors,
+db.lck locks, file conflicts, broken dependencies, AUR build failures and partial upgrades.
+**Scheduled automatic updates** (late at night, when idle, or at a set time) and a **software search**
+that shows popularity, votes and last update. Works on Arch, Manjaro, EndeavourOS, CachyOS and Garuda.
 
 **[Website](https://mneftekhar.github.io/arch-smart-update/)** · [Install](#install) · [What it can fix](#what-it-can-fix)
 
-![Main menu](screenshots/menu.png)
+![Arch Smart Update main menu: update, repair, install software and scheduled updates](screenshots/menu.png)
 
 </div>
 
@@ -22,6 +26,7 @@ and a plain-language explanation (plus a one-click fix) when something fails.
 - [Screenshots](#screenshots)
 - [Install](#install)
 - [Usage](#usage)
+- [Scheduled updates](#scheduled-updates)
 - [What it can fix](#what-it-can-fix)
 - [Configuration](#configuration)
 - [Safety](#safety)
@@ -92,6 +97,8 @@ Optional: add it to your application menu with `./smart-update.sh --install-desk
 | `./smart-update.sh --run` | Full update straight away |
 | `./smart-update.sh --dry-run` | Shows what would be updated, changes nothing |
 | `./smart-update.sh --auto` | Applies safe fixes without asking |
+| `./smart-update.sh --detailed` | Detailed view: full output, a plan first, you answer every question and can skip steps |
+| `./smart-update.sh --schedule` | Set up scheduled updates (see below) |
 | `./smart-update.sh --download-only` | Downloads now, install later (good on slow internet) |
 | `./smart-update.sh --diagnose FILE` | Explains a saved pacman / paru / yay error log |
 | `./smart-update.sh --setup` | Checks what the script needs, explains why, installs what's missing |
@@ -99,6 +106,32 @@ Optional: add it to your application menu with `./smart-update.sh --install-desk
 
 **Keys while it runs:** `Ctrl+C` skips the current step · `Ctrl+\` stops everything (postponed
 until pacman has finished, so your system is never left half-updated).
+
+<sub>[↑ back to contents](#contents)</sub>
+
+## Scheduled updates
+
+Menu → **⏰ Scheduled updates** (or `./smart-update.sh --schedule`). It installs a systemd **user**
+timer (`~/.config/systemd/user/arch-smart-update.timer`), so there is no cron and no root daemon.
+Every few minutes the timer runs a quick check, and the update starts only when the moment is right.
+
+| Choice | Options |
+|---|---|
+| **When** | 🌙 late at night inside a window you pick (e.g. `01:00-06:00`, may cross midnight) while the computer is idle · 💤 any time it is idle · 🕒 at a fixed time |
+| **How often** | daily · once a week (pick the day) · weekdays · weekends · your own days (`Mon,Thu`) |
+| **Idle means** | no keyboard/mouse for N minutes, CPU load below a limit, no app keeping the screen awake (video, call); a locked screen counts as idle |
+| **View** | 🤖 **simple**: fully automatic in the background, safe fixes applied, notification at the end · 🔍 **detailed**: a terminal window opens with a plan and the full output. You answer pacman/AUR/Flatpak questions yourself, confirm every fix, and can skip each step. It counts down 90 s before starting, and you can postpone 1 h or skip |
+| **What** | full smart update · official packages only · download only |
+| **Rules** | only on AC power · skip on metered connections · a missed run happens at the next idle moment or in the next window · a night with no idle moment is skipped (with a notification) or run at the window's end |
+
+`--schedule status` shows the next run and the last result, `--schedule test` explains why it would
+or would not run right now, and `--schedule log` prints its log (`~/.local/state/smart-update/schedule.log`).
+To watch a background run live, open the menu in any terminal.
+
+Notes: idle time on KDE Plasma, Sway and Hyprland (Wayland) is read with `swayidle` (the setup
+offers to install it); GNOME and X11 work without it; without any of them it waits for the screen to
+lock. The simple view needs sudo without a password prompt (the setup explains the options). Turn on
+*Run while logged out* (linger) if night updates should also run at the login screen.
 
 <sub>[↑ back to contents](#contents)</sub>
 

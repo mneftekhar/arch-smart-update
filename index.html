@@ -3,11 +3,76 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Arch Smart Update</title>
-<meta name="description" content="One command to update Arch Linux — official packages, AUR, Flatpak and Snap — with plain-language fixes when something goes wrong.">
-<meta property="og:title" content="Arch Smart Update">
-<meta property="og:description" content="Update Arch Linux with one command. When something fails, it explains why and fixes it.">
-<meta property="og:image" content="https://mneftekhar.github.io/arch-smart-update/screenshots/menu.png">
+<title>Arch Smart Update — self-repairing Arch Linux updater for pacman, AUR, Flatpak &amp; Snap</title>
+<meta name="description" content="Free Arch Linux update script: updates pacman, AUR (paru/yay), Flatpak and Snap in one command, explains errors in plain language and fixes keyring, mirror, lock and conflict problems. Scheduled automatic updates while idle.">
+<meta name="keywords" content="arch linux updater, arch linux update script, pacman update, aur update, paru, yay, flatpak, snap, archlinux-keyring error, pacman fix, automatic updates arch, systemd timer, manjaro, endeavouros, cachyos, garuda">
+<meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
+<meta name="author" content="mneftekhar">
+<meta name="theme-color" content="#7c3aed">
+<link rel="canonical" href="https://mneftekhar.github.io/arch-smart-update/">
+<link rel="sitemap" type="application/xml" href="https://mneftekhar.github.io/arch-smart-update/sitemap.xml">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Arch Smart Update">
+<meta property="og:url" content="https://mneftekhar.github.io/arch-smart-update/">
+<meta property="og:title" content="Arch Smart Update — the self-repairing Arch Linux updater">
+<meta property="og:description" content="Update Arch Linux, AUR, Flatpak and Snap with one command. When something fails, it explains why and fixes it.">
+<meta property="og:image" content="https://mneftekhar.github.io/arch-smart-update/site/menu.png">
+<meta property="og:image:width" content="1600">
+<meta property="og:image:height" content="1086">
+<meta property="og:image:alt" content="The Arch Smart Update menu in a terminal">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Arch Smart Update — the self-repairing Arch Linux updater">
+<meta name="twitter:description" content="pacman, AUR, Flatpak and Snap in one command, with plain-language fixes when something breaks.">
+<meta name="twitter:image" content="https://mneftekhar.github.io/arch-smart-update/site/menu.png">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "SoftwareApplication",
+      "name": "Arch Smart Update",
+      "alternateName": ["arch-smart-update", "smart-update.sh"],
+      "description": "A self-repairing updater for Arch Linux and Arch-based distributions. Updates official packages, AUR, Flatpak and Snap in one run, explains failures in plain language, applies fixes for 60+ known problems, and can run scheduled updates while the computer is idle.",
+      "applicationCategory": "UtilitiesApplication",
+      "applicationSubCategory": "Package manager front-end",
+      "operatingSystem": "Arch Linux, Manjaro, EndeavourOS, CachyOS, Garuda Linux and other Arch-based distributions",
+      "softwareVersion": "4.1.0",
+      "license": "https://opensource.org/licenses/MIT",
+      "isAccessibleForFree": true,
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+      "url": "https://mneftekhar.github.io/arch-smart-update/",
+      "downloadUrl": "https://github.com/mneftekhar/arch-smart-update",
+      "codeRepository": "https://github.com/mneftekhar/arch-smart-update",
+      "programmingLanguage": "Bash",
+      "screenshot": "https://mneftekhar.github.io/arch-smart-update/site/menu.png",
+      "featureList": [
+        "Updates pacman, AUR (paru, yay, pikaur, trizen, pamac), Flatpak, Snap and firmware in one run",
+        "Plain-language diagnosis of pacman and AUR errors",
+        "Fixes for keyring, mirror, lock, file conflict, dependency, DKMS and partial-upgrade problems",
+        "Scheduled updates: late at night, when idle, or at a fixed time, daily or weekly",
+        "Simple automatic view or detailed interactive view",
+        "Software search with categories, plugins grouped under their app, popularity, votes and last update",
+        "Works on slow or filtered internet: resumable downloads, DNS-over-HTTPS, in-country mirrors, proxies"
+      ]
+    },
+    {
+      "@type": "FAQPage",
+      "mainEntity": [
+        { "@type": "Question", "name": "How do I update Arch Linux and the AUR with one command?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Run ./smart-update.sh --run. It refreshes mirrors when needed, updates the keyring first, upgrades official packages with pacman, then AUR packages with paru or yay, then Flatpak and Snap, and cleans the package cache." } },
+        { "@type": "Question", "name": "How do I fix 'signature is unknown trust' or archlinux-keyring errors?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Arch Smart Update recognises keyring and PGP signature errors, explains them, and offers the fix: it updates archlinux-keyring first and refreshes or re-initialises the pacman keys, then retries the update." } },
+        { "@type": "Question", "name": "Can Arch Linux update automatically at night or when the computer is idle?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Yes. Under Scheduled updates you pick late at night while idle, any idle moment, or a fixed time, daily, weekly or on chosen days. It uses a systemd user timer and waits for AC power and a non-metered connection." } },
+        { "@type": "Question", "name": "Is it safe? Will it leave my system half-updated?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Fixes are explained and asked first. The emergency stop waits until pacman has finished installing, files are moved to a backup instead of deleted, and AUR builds are skipped if the system update did not finish." } },
+        { "@type": "Question", "name": "Does it work on Manjaro, EndeavourOS, CachyOS and Garuda?",
+          "acceptedAnswer": { "@type": "Answer", "text": "It works on Arch Linux and Arch-based distributions that use pacman. It needs only bash, sudo and curl; everything else is optional and explained by --setup." } }
+      ]
+    }
+  ]
+}
+</script>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 3 29 16 16 29 3 16Z' fill='%238b5cf6'/%3E%3C/svg%3E">
 <style>
 :root{
@@ -103,6 +168,13 @@ figcaption b{color:var(--text);font-weight:600}
 .steps p{margin:0;color:var(--muted);font-size:15.5px}
 .steps code{font-size:13.5px;background:var(--accent-soft);color:var(--text);padding:2px 6px;border-radius:5px;word-break:break-word}
 
+/* faq */
+.faq{display:grid;gap:12px;max-width:820px}
+.faq details{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:16px 20px}
+.faq summary{cursor:pointer;font-weight:600;font-size:17px;list-style-position:outside}
+.faq summary:focus-visible{outline:2px solid var(--accent);outline-offset:4px;border-radius:4px}
+.faq details p{margin:10px 0 0;color:var(--muted);font-size:15.5px}
+.faq code{font-size:13.5px;background:var(--accent-soft);color:var(--text);padding:2px 6px;border-radius:5px;word-break:break-word}
 /* footer */
 footer{border-top:1px solid var(--line);padding:32px 0 48px;color:var(--muted);font-size:14.5px}
 footer .wrap{display:flex;flex-wrap:wrap;gap:12px 24px;justify-content:space-between}
@@ -117,6 +189,7 @@ footer .wrap{display:flex;flex-wrap:wrap;gap:12px 24px;justify-content:space-bet
       <a href="#why">Why</a>
       <a href="#see-it">See it</a>
       <a href="#start">Get started</a>
+      <a href="#faq">FAQ</a>
     </nav>
     <a class="gh" href="https://github.com/mneftekhar/arch-smart-update">
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38v-1.33c-2.23.48-2.7-1.07-2.7-1.07-.36-.92-.89-1.17-.89-1.17-.73-.5.05-.49.05-.49.8.06 1.23.83 1.23.83.72 1.22 1.87.87 2.33.66.07-.52.28-.87.5-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.6 7.6 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48v2.2c0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
@@ -127,7 +200,7 @@ footer .wrap{display:flex;flex-wrap:wrap;gap:12px 24px;justify-content:space-bet
 
 <main id="top">
   <div class="wrap hero">
-    <span class="eyebrow">For Arch Linux · free &amp; open source</span>
+    <span class="eyebrow">Arch Linux updater for pacman, AUR, Flatpak &amp; Snap · free &amp; open source</span>
     <h1>Update Arch without the worry.</h1>
     <p class="lead">One command updates everything. If something breaks, it tells you why in plain words — and fixes it.</p>
     <div class="install">
@@ -176,6 +249,16 @@ footer .wrap{display:flex;flex-wrap:wrap;gap:12px 24px;justify-content:space-bet
           <h3>Made for unreliable internet</h3>
           <p>Resumable downloads, DNS-over-HTTPS fallback, in-country mirrors and proxy detection get updates through slow or filtered networks.</p>
         </div>
+        <div class="pro">
+          <div class="ic"><svg viewBox="0 0 24 24"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5M9 2h6"/></svg></div>
+          <h3>Scheduled updates, your way</h3>
+          <p>Late at night while you're away, whenever the computer is idle, or at a fixed time — daily, weekly or on chosen days. Fully automatic, or a detailed view where you answer every question.</p>
+        </div>
+        <div class="pro">
+          <div class="ic"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></div>
+          <h3>Find the right software</h3>
+          <p>Search the repos and the AUR at once. Results are sorted into apps, plugins (grouped under the app they need), libraries, fonts and themes — with popularity, AUR votes and the last update date.</p>
+        </div>
       </div>
     </div>
   </section>
@@ -215,6 +298,24 @@ footer .wrap{display:flex;flex-wrap:wrap;gap:12px 24px;justify-content:space-bet
         <li><h3>Open the menu</h3><p><code>./arch-smart-update/smart-update.sh</code> — pick an item with a click, the arrows or its hotkey.</p></li>
         <li><h3>Or update right away</h3><p><code>--run</code> for a full update, <code>--dry-run</code> to preview, <code>--auto</code> to apply safe fixes without asking.</p></li>
       </ol>
+    </div>
+  </section>
+  <section id="faq">
+    <div class="wrap">
+      <p class="kicker">Questions</p>
+      <h2>Common questions about updating Arch Linux.</h2>
+      <div class="faq">
+        <details><summary>How do I update Arch Linux and the AUR with one command?</summary>
+          <p>Run <code>./smart-update.sh --run</code>. It refreshes mirrors when needed, updates the keyring first, upgrades official packages with pacman, then AUR packages with paru or yay, then Flatpak and Snap, and cleans the package cache.</p></details>
+        <details><summary>How do I fix "signature is unknown trust" or archlinux-keyring errors?</summary>
+          <p>Arch Smart Update recognises keyring and PGP signature errors, explains them, and offers the fix: it updates <code>archlinux-keyring</code> first and refreshes or re-initialises the pacman keys, then retries the update.</p></details>
+        <details><summary>Can Arch Linux update automatically at night or when the computer is idle?</summary>
+          <p>Yes. Under <b>Scheduled updates</b> you pick late at night while idle, any idle moment, or a fixed time, daily, weekly or on chosen days. It uses a systemd user timer and waits for AC power and a non-metered connection.</p></details>
+        <details><summary>Is it safe? Will it leave my system half-updated?</summary>
+          <p>Fixes are explained and asked first. The emergency stop waits until pacman has finished installing, files are moved to a backup instead of deleted, and AUR builds are skipped if the system update did not finish.</p></details>
+        <details><summary>Does it work on Manjaro, EndeavourOS, CachyOS and Garuda?</summary>
+          <p>It works on Arch Linux and Arch-based distributions that use pacman. It needs only <code>bash</code>, <code>sudo</code> and <code>curl</code>; everything else is optional and explained by <code>--setup</code>.</p></details>
+      </div>
     </div>
   </section>
 </main>
