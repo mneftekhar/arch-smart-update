@@ -1,0 +1,6 @@
+pkgbase = demo
+	pkgdesc = Demo package
+	arch = x86_64
+	arch = x86_64 # duplicate values are ignored
+	license = MIT
+# command substitution is inert text: $(touch should-not-exist)

@@ -8,8 +8,9 @@ A free, self-repairing **Arch Linux updater** (Bash script): **pacman**, **AUR**
 **Flatpak** and **Snap** in the right order, a clean live view while it works, and a plain-language
 explanation, plus a one-click fix, when something fails: keyring and PGP signature errors, mirrors,
 db.lck locks, file conflicts, broken dependencies, AUR build failures and partial upgrades.
-**Scheduled automatic updates** (late at night, when idle, or at a set time) and a **software search**
-that shows popularity, votes and last update. Works on Arch, Manjaro, EndeavourOS, CachyOS and Garuda.
+**Scheduled automatic updates** (late at night, when idle, or at a set time) and a **software search
+and installer** with popularity, votes, update dates, variant comparison, similar apps and multi-package
+previews. Works on Arch, Manjaro, EndeavourOS, CachyOS and Garuda.
 
 **[Website](https://mneftekhar.github.io/arch-smart-update/)** · [Install](#install) · [What it can fix](#what-it-can-fix)
 
@@ -26,6 +27,7 @@ that shows popularity, votes and last update. Works on Arch, Manjaro, EndeavourO
 - [Screenshots](#screenshots)
 - [Install](#install)
 - [Usage](#usage)
+  - [Install software](#install-software)
 - [Scheduled updates](#scheduled-updates)
 - [What it can fix](#what-it-can-fix)
 - [Configuration](#configuration)
@@ -106,6 +108,67 @@ Optional: add it to your application menu with `./smart-update.sh --install-desk
 
 **Keys while it runs:** `Ctrl+C` skips the current step · `Ctrl+\` stops everything (postponed
 until pacman has finished, so your system is never left half-updated).
+
+### Install software
+
+Menu → **Install software** searches the official repositories and the AUR together. Results show the
+source, installed state and available popularity/update metadata. Mark several applications before
+installing; an installed package cannot be marked again accidentally, but it has an explicit **Reinstall**
+action.
+
+| Interface | Selection and actions |
+|---|---|
+| **Modern terminal** | Arrow keys or `j`/`k` move · `Space` marks/unmarks and advances · `Enter` opens **Details** · `c` opens **Compare** · `i` opens **Install marked** · `r` chooses **Reinstall** for an installed row · `[`/`]` page the right details panel · `Esc`, left arrow or `q` goes **Back**. Mouse hover, clicks and the on-screen buttons work too; the wheel scrolls details when over the right panel. |
+| **Classic dialog/whiptail** | Activate a package row to toggle it without leaving the results. Separate **Details**, **Compare**, **Install marked** and **Back** rows are provided; **Reinstall** appears when the current package is installed. Use the dialog tool's normal arrow/activation controls. |
+| **GUI (Zenity)** | Activate package rows to toggle them, then use the same **Details**, **Compare**, **Reinstall**, **Install marked** and **Back** rows. |
+| **Plain numbered menu** | `N`, `N-M` or `N,M` toggles rows · `+N` marks · `-N` unmarks · `d N` opens **Details** · `c N` opens **Compare** · `r N` chooses **Reinstall** · `i` opens **Install marked** · `q` goes **Back**. |
+
+On a wide modern terminal, the right panel shows the highlighted package's complete normalized metadata from
+top to bottom. A cached search summary appears immediately; complete details load in the background and stay
+cached. Navigation does not wait for network metadata, and unchanged redraws reuse cached plugin-parent state.
+
+**Details → Similar apps** shows alternatives only when shared keywords, groups or description terms meet
+its evidence threshold, and shows the reason beside each suggestion. If there is no reliable suggestion it
+says so; a suggestion is never marked automatically. **Compare** reviews available official, `-bin`, source
+and VCS variants. A recommendation is **advisory**: reviewing it does not select or install anything. Even
+**Use this variant** only changes marks explicitly and still requires the normal installation preview and
+confirmation.
+
+**Install marked** checks plugin/core requirements first. A missing core application is added once and
+announced; ambiguity or a conflict blocks confirmation rather than guessing. All marked packages share one
+aggregated preview with deduplicated runtime dependencies, auto-added cores, build-only requirements and
+optional extras. Build-only packages are identified as such, not as requested applications, and optional
+extras are not installed unless picked. Plugin rows recompute their required core's **installed / selected /
+missing** state whenever the results redraw. Virtual optional requirements keep their requested name and
+resolved provider separate; multiple valid providers block confirmation with the candidates listed rather
+than choosing one implicitly.
+
+Without Python, basic official/AUR search, repeated multi-select, grouped installation and verification
+remain available. Official metadata still comes from pacman; helper-only AUR metadata is shown as **Not
+available**, and the AUR helper remains responsible for dependency resolution and its own prompts. Enriched
+**Compare** and **Similar apps** are honestly reported as unavailable in this mode.
+
+One **Install** confirmation covers the whole preview. When both groups are present, the official pacman
+command runs before the AUR-helper command. Pacman and the AUR helper keep their own confirmation and
+PKGBUILD-review prompts; the script does not add `--noconfirm`. It verifies every requested package and
+chosen extra afterward. Success refreshes installed markers and versions and returns to the **same search
+results and metadata cache**, with completed marks cleared so they cannot be installed again silently.
+Failed or missing results keep their selection and diagnostic state.
+
+Metadata is source-specific and unavailable values are shown honestly:
+
+- Official **Latest update** is the **Package build date**; AUR **Latest update** is the **AUR recipe
+  update**, not necessarily an upstream release or a local build time.
+- AUR can show **First submitted to AUR**. An official package's first release is **not tracked by pacman**.
+- Official package and installed sizes come from pacman. **AUR package size is not published**, and **AUR
+  installed size is unknown until built**.
+- AUR votes and AUR popularity are not fabricated for official packages. The separate pkgstats share covers
+  only Arch systems that report statistics, not all users.
+- AUR architecture comes from an inert `.SRCINFO` parse when available; the script does not execute a
+  PKGBUILD to discover metadata. Missing licenses, maintainers, requirements or other fields are reported
+  as unavailable or not declared rather than invented.
+- Recommendations and Similar apps use deterministic local metadata, not an external AI service. Neither
+  feature automatically selects or installs a package.
 
 <sub>[↑ back to contents](#contents)</sub>
 

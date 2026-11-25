@@ -152,6 +152,7 @@ RESCUE_PROXY=""
 REPORT_FILE=""
 REPORT_ONLY=false
 SETUP_REQUESTED=""
+INSTALL_HELPER_REQUEST=""
 NOTIFY_ID=""
 SLOW_LEVEL=0                 # 0 normal | 1 fewer parallel downloads, no timeout | 2 curl with retries + HTTP/1.1
 declare -a SKIP_REPOS=() AUR_IGNORE=()
@@ -4559,6 +4560,251 @@ tui_text() {  # whiptail/dialog (newt) cannot draw emoji: drop them and map typo
         -e 's/^ +//; s/  +/  /g'
 }
 
+declare -A PM_MARKED=() PM_INSTALLED_STATE=() PM_INSTALLED_VERSION=()
+declare -A PM_AUTO_ADDED=() PM_REINSTALL=() PM_EXTRAS=() PM_CORE_OVERRIDES=()
+declare -A PM_PLAN_OPTIONS=() PM_VERIFY_STATUS=() PM_EXTRA_SOURCE=() PM_EXTRA_PROVIDER=()
+declare -a PM_SELECTION_ORDER=() PM_INSTALL_REPO=() PM_INSTALL_AUR=()
+declare -a PM_NOTICES=() PM_CONFLICTS=() PM_UNRESOLVED=() PM_AMBIGUOUS=()
+declare -a PM_VERIFY_MISSING=() PM_INSTALL_LOGS=() PM_PLAN_MAKE=()
+PM_ACTION=""
+PM_FOCUS=""
+PM_NOTICE=""
+PM_LABEL=""
+PM_CLOSURE_JSON=""
+PM_COMPARE_JSON=""
+PM_COMPARE_TEXT=""
+PM_RECOMMENDED_KEY=""
+declare -a PM_COMPARE_KEYS=() PM_REPLACE_KEYS=()
+declare -a PM_SIMILAR_KEYS=() PM_SIMILAR_LABELS=()
+declare -A PM_SIMILAR_REASONS=()
+declare -A PM_PARENT_BY_KEY=() PM_PARENT_STATE_CACHE=()
+declare -A PM_PANEL_SUMMARY=() PM_PANEL_TEXT=() PM_PANEL_FAILED=()
+PM_PARENT_CACHE_SIG=""
+PM_PANEL_PENDING=""
+PM_PANEL_CURRENT=""
+PM_PANEL_SELECTED=""
+PM_PANEL_PID=""
+PM_PANEL_FILE=""
+PM_PANEL_OFFSET=0
+PM_PANEL_PAGE=10
+PM_PANEL_UPDATED=false
+PM_SIMILAR_JSON=""
+PM_INSTALL_SUCCESS=false
+PM_INSTALL_ERROR=""
+
+pm_toggle_key() {  # pm_toggle_key KEY [REINSTALL] -> PM_MARKED / PM_NOTICE
+    local key=$1 reinstall=${2:-false}
+    local name=${key#*:} item current=false rc
+    local -a dependents=() kept=()
+    [[ $key != @* ]] || { PM_NOTICE="Section headings cannot be selected"; return 1; }
+    if [[ -n ${PM_MARKED[$key]:-} ]]; then
+        if have python3 && [[ -n ${TMP:-} && ! -r $TMP/selection-records.json ]] && (( ${#R_KEYS[@]} )); then
+            for item in "${R_KEYS[@]}"; do [[ $item == "$key" ]] && { current=true; break; }; done
+            if [[ $current != true ]]; then
+                PM_NOTICE="Requirements for $key could not be evaluated; selection unchanged. Restore $key or retry when metadata is available."
+                return 1
+            fi
+            pm_selection_records_load; rc=$?
+            if (( rc != 0 )) || [[ ! -r $TMP/selection-records.json ]]; then
+                PM_NOTICE="Requirements for $key could not be evaluated; selection unchanged. Restore $key or retry when metadata is available."
+                return 1
+            fi
+        fi
+        if have python3 && [[ -n ${TMP:-} && -r $TMP/selection-records.json ]]; then
+            printf '%s\n' "${!PM_MARKED[@]}" >"$TMP/selection-selected"
+            pacman -Qq >"$TMP/selection-installed" 2>/dev/null; rc=$?
+            (( rc == 0 )) || {
+                PM_NOTICE="Requirements for $key could not be evaluated; selection unchanged. Restore $key or retry when metadata is available."
+                return 1
+            }
+            python3 -I -c "$PM_PACKAGE_LIB_PY" --core-dependents \
+                "$TMP/selection-records.json" "$TMP/selection-selected" "$TMP/selection-installed" "$key" \
+                >"$TMP/selection-dependents" 2>/dev/null; rc=$?
+            if (( rc != 0 )); then
+                PM_NOTICE="Requirements for $key could not be evaluated; selection unchanged. Restore $key or retry when metadata is available."
+                return 1
+            fi
+            mapfile -t dependents <"$TMP/selection-dependents"
+            if (( ${#dependents[@]} )); then
+                PM_NOTICE="Cannot unmark required core application $name. Restore $name or unmark the dependent plugin(s) first: ${dependents[*]}"
+                return 1
+            fi
+        fi
+        unset 'PM_MARKED[$key]' 'PM_REINSTALL[$key]' 'PM_AUTO_ADDED[$key]' 'PM_EXTRAS[$key]'
+        for item in "${PM_SELECTION_ORDER[@]}"; do [[ $item == "$key" ]] || kept+=("$item"); done
+        PM_SELECTION_ORDER=("${kept[@]}")
+    else
+        if pacman -Qq -- "$name" &>/dev/null && [[ $reinstall != true ]]; then
+            PM_NOTICE="$key is already installed; choose Reinstall to install it again"
+            return 1
+        fi
+        PM_MARKED[$key]=1
+        PM_SELECTION_ORDER+=("$key")
+        if [[ $reinstall == true ]] && pacman -Qq -- "$name" &>/dev/null; then PM_REINSTALL[$key]=1; fi
+    fi
+    PM_NOTICE=""
+    return 0
+}
+
+pm_key_installed() {  # cache exact local state/version for this result set
+    local key=$1 query
+    local name=${key#*:}
+    if [[ -z ${PM_INSTALLED_STATE[$key]:-} ]]; then
+        if query=$(pacman -Q -- "$name" 2>/dev/null); then
+            PM_INSTALLED_STATE[$key]=yes
+            query=${query%%$'\n'*}
+            if [[ $query == "$name "* ]]; then PM_INSTALLED_VERSION[$key]=${query#"$name "}; else PM_INSTALLED_VERSION[$key]=""; fi
+        else
+            PM_INSTALLED_STATE[$key]=no
+            PM_INSTALLED_VERSION[$key]=""
+        fi
+    fi
+    [[ ${PM_INSTALLED_STATE[$key]} == yes ]]
+}
+
+pm_parent_state() {  # pm_parent_state KEY -> cached PM_PARENT / PM_PARENT_STATE for the current selection
+    local key=$1 item identity n c par rest signature
+    PM_PARENT="" PM_PARENT_STATE=""
+    [[ -n ${TMP:-} && -r $TMP/search_meta ]] || return 1
+    signature="${#PM_MARKED[@]}:${!PM_MARKED[*]}"
+    if [[ $signature != "$PM_PARENT_CACHE_SIG" ]]; then
+        PM_PARENT_STATE_CACHE=()
+        PM_PARENT_CACHE_SIG=$signature
+    fi
+    if [[ -z ${PM_PARENT_BY_KEY[$key]+present} ]]; then
+        PM_PARENT_BY_KEY[$key]=""
+        while IFS='|' read -r n c par rest; do
+            if [[ $n == "${key#*:}" && $c == plugin && -n $par ]]; then PM_PARENT_BY_KEY[$key]=$par; break; fi
+        done < "$TMP/search_meta"
+    fi
+    PM_PARENT=${PM_PARENT_BY_KEY[$key]}
+    [[ -n $PM_PARENT ]] || return 1
+    if [[ -n ${PM_PARENT_STATE_CACHE[$PM_PARENT]+present} ]]; then
+        PM_PARENT_STATE=${PM_PARENT_STATE_CACHE[$PM_PARENT]}
+        return 0
+    fi
+    if pacman -T -- "$PM_PARENT" &>/dev/null; then
+        PM_PARENT_STATE=installed
+    else
+        for item in "${!PM_MARKED[@]}"; do
+            [[ ${item#*:} == "$PM_PARENT" ]] && { PM_PARENT_STATE=selected; break; }
+        done
+        if [[ -z $PM_PARENT_STATE ]] && (( ${#PM_MARKED[@]} )) && command -v python3 >/dev/null 2>&1 \
+            && [[ -r $TMP/search_meta.jsonl || -r $TMP/selection-records.json ]]; then
+            while IFS= read -r identity; do
+                [[ $identity == "$PM_PARENT" ]] && { PM_PARENT_STATE=selected; break; }
+            done < <(python3 -I -c "$PM_PACKAGE_LIB_PY" --selected-identities \
+                "$TMP/search_meta" "$TMP/selection-records.json" "${!PM_MARKED[@]}" 2>/dev/null)
+        fi
+        [[ -n $PM_PARENT_STATE ]] || PM_PARENT_STATE=missing
+    fi
+    PM_PARENT_STATE_CACHE[$PM_PARENT]=$PM_PARENT_STATE
+    return 0
+}
+
+pm_selection_label() {  # pm_selection_label KEY LABEL -> PM_LABEL with selection state and original metadata
+    local key=$1 label=$2 marker="[ ]"
+    if pm_key_installed "$key"; then
+        marker="[installed]"
+        [[ -n ${PM_MARKED[$key]:-} ]] && marker="[✓ installed]"
+    elif [[ -n ${PM_MARKED[$key]:-} ]]; then
+        marker="[✓]"
+    fi
+    PM_LABEL="$marker $label"
+    if [[ ${PM_INSTALLED_STATE[$key]:-} == yes && -n ${PM_INSTALLED_VERSION[$key]:-} ]]; then
+        PM_LABEL+=" · installed version ${PM_INSTALLED_VERSION[$key]}"
+    fi
+    if pm_parent_state "$key"; then
+        PM_LABEL+=" · requires core: $PM_PARENT ($PM_PARENT_STATE)"
+    fi
+}
+
+pm_panel_summary() {  # cached, normalized search details without a metadata fetch
+    local key=$1 parent_state="" text
+    [[ -n ${PM_PANEL_SUMMARY[$key]+present} ]] && return 0
+    if ! command -v python3 >/dev/null 2>&1 || [[ ! -r $TMP/search_meta.jsonl ]]; then
+        PM_PANEL_SUMMARY[$key]=""
+        return 1
+    fi
+    pm_parent_state "$key" && parent_state=$PM_PARENT_STATE
+    if text=$(python3 -I -c "$PM_PACKAGE_LIB_PY" --summary-details \
+        "$TMP/search_meta" "$key" "$parent_state" 2>/dev/null); then
+        PM_PANEL_SUMMARY[$key]=$text
+    else
+        PM_PANEL_SUMMARY[$key]=""
+        return 1
+    fi
+}
+
+pm_panel_cancel() {
+    if [[ -n $PM_PANEL_PID ]]; then
+        kill "$PM_PANEL_PID" 2>/dev/null || :
+        wait "$PM_PANEL_PID" 2>/dev/null || :
+    fi
+    PM_PANEL_PID="" PM_PANEL_PENDING="" PM_PANEL_CURRENT=""
+    [[ -z ${PM_PANEL_FILE:-} ]] || rm -f -- "$PM_PANEL_FILE.tmp"
+}
+
+pm_panel_reset() {
+    pm_panel_cancel
+    PM_PANEL_SUMMARY=() PM_PANEL_TEXT=() PM_PANEL_FAILED=()
+    PM_PANEL_SELECTED="" PM_PANEL_OFFSET=0 PM_PANEL_UPDATED=false
+    [[ -z ${TMP:-} || ! -d $TMP ]] || rm -f -- "$TMP"/panel-*.txt "$TMP"/panel-*.txt.failed
+}
+
+pm_panel_pump() {  # nonblocking worker reaping and one pending metadata load
+    PM_PANEL_UPDATED=false
+    [[ -n ${TMP:-} ]] || return 0
+    if [[ -n $PM_PANEL_PID ]] && ! kill -0 "$PM_PANEL_PID" 2>/dev/null; then
+        wait "$PM_PANEL_PID" 2>/dev/null || :
+        PM_PANEL_PID=""
+        if [[ -n $PM_PANEL_CURRENT && -s $PM_PANEL_FILE ]]; then
+            PM_PANEL_TEXT[$PM_PANEL_CURRENT]=$(<"$PM_PANEL_FILE")
+            PM_PANEL_UPDATED=true
+        elif [[ -n $PM_PANEL_CURRENT ]]; then
+            PM_PANEL_FAILED[$PM_PANEL_CURRENT]=1
+            PM_PANEL_UPDATED=true
+        fi
+    fi
+    [[ -z $PM_PANEL_PID && -n $PM_PANEL_PENDING ]] || return 0
+    PM_PANEL_CURRENT=$PM_PANEL_PENDING
+    PM_PANEL_PENDING=""
+    [[ -z ${PM_PANEL_TEXT[$PM_PANEL_CURRENT]+present} ]] || return 0
+    [[ -z ${PM_PANEL_FAILED[$PM_PANEL_CURRENT]+present} ]] || return 0
+    PM_PANEL_FILE="$TMP/panel-${PM_PANEL_CURRENT/:/%}.txt"
+    if [[ -s $PM_PANEL_FILE ]]; then
+        PM_PANEL_TEXT[$PM_PANEL_CURRENT]=$(<"$PM_PANEL_FILE")
+        PM_PANEL_UPDATED=true
+        return 0
+    fi
+    if [[ -e $PM_PANEL_FILE.failed ]]; then
+        PM_PANEL_FAILED[$PM_PANEL_CURRENT]=1
+        return 0
+    fi
+    (
+        key=$PM_PANEL_CURRENT
+        if pm_about "${key#*:}" "${key%%:*}" >"$PM_PANEL_FILE.tmp" 2>>"$TMP/panel-errors" \
+            && [[ -s $PM_PANEL_FILE.tmp ]]; then
+            mv -f -- "$PM_PANEL_FILE.tmp" "$PM_PANEL_FILE"
+        else
+            rm -f -- "$PM_PANEL_FILE.tmp"
+            : >"$PM_PANEL_FILE.failed"
+        fi
+    ) &
+    PM_PANEL_PID=$!
+}
+
+pm_panel_select() {
+    local key=$1
+    if [[ $key != "$PM_PANEL_SELECTED" ]]; then
+        PM_PANEL_SELECTED=$key
+        PM_PANEL_OFFSET=0
+    fi
+    [[ -z ${PM_PANEL_TEXT[$key]+present} && -z ${PM_PANEL_FAILED[$key]+present} ]] || return 0
+    PM_PANEL_PENDING=$key
+    pm_panel_pump
+}
+
 ui_choose() {  # ui_choose "title" "prompt" key label [key label]...  -> prints chosen key; 1 = cancelled
     local title=$1 prompt=$2 i ans tool=""
     shift 2
@@ -4604,6 +4850,176 @@ ui_choose() {  # ui_choose "title" "prompt" key label [key label]...  -> prints 
         [[ ${ans,,} == q ]] && return 1
         if [[ $ans =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= ${#keys[@]} )); then echo "${keys[$(( ans - 1 ))]}"; return 0; fi
         echo "  Not a valid choice" >&2
+    done
+}
+
+ui_multiselect() {  # ui_multiselect TITLE PROMPT key label... -> PM_ACTION / PM_FOCUS / PM_MARKED
+    local title=$1 prompt=$2 i key label choice frontend ans command rest token
+    shift 2
+    local -a base_keys=() base_labels=() keys=() labels=() rows=() plain_keys=()
+    while (( $# >= 2 )); do
+        base_keys+=("$1"); base_labels+=("$2"); shift 2
+    done
+    (( ${#base_keys[@]} )) || { PM_ACTION=back; return 1; }
+    PM_ACTION=""
+    PM_NOTICE=""
+    if [[ -z $PM_FOCUS ]]; then
+        for key in "${base_keys[@]}"; do [[ $key != @* ]] && { PM_FOCUS=$key; break; }; done
+    fi
+    if [[ $GUI == true && $GUI_TOOL == zenity ]]; then
+        frontend=zenity
+    elif tui_ok; then
+        local multi=true
+        keys=("${base_keys[@]}"); labels=("${base_labels[@]}")
+        tui_menu "$title" "$prompt"
+        return
+    else
+        [[ -t 0 ]] || { PM_ACTION=back; return 1; }
+        if [[ $MENU_STYLE != plain ]]; then
+            if have dialog; then frontend=dialog; elif have whiptail; then frontend=whiptail; fi
+        fi
+    fi
+
+    if [[ -z $frontend ]]; then
+        while :; do
+            plain_keys=()
+            {
+                printf '\n%s━━ %s ━━%s\n' "$BOLD$PURPLE" "$title" "$NC"
+                printf '%s\n\n' "$prompt"
+                local n=0 number
+                for i in "${!base_keys[@]}"; do
+                    key=${base_keys[i]}
+                    if [[ $key == @* ]]; then
+                        printf '  %s%s%s\n' "$BOLD" "${base_labels[i]^^}" "$NC"
+                        continue
+                    fi
+                    n=$((n + 1)); number=$n
+                    plain_keys+=("$key")
+                    pm_selection_label "$key" "${base_labels[i]}"
+                    printf '  %s%2d)%s %s\n' "$CYAN" "$number" "$NC" "$PM_LABEL"
+                done
+                [[ -n $PM_NOTICE ]] && printf '\n%s\n' "$PM_NOTICE"
+                printf '\nCommands: N, N-M, or N,M toggle · +N mark · -N unmark · d N details · c N compare · r N reinstall\n'
+                printf '         i install marked (%d) · q back\n' "${#PM_MARKED[@]}"
+            } >&2
+            read -r -p "Selection> " ans
+            ans=${ans#"${ans%%[![:space:]]*}"}; ans=${ans%"${ans##*[![:space:]]}"}
+            [[ -n $ans ]] || continue
+            read -r command rest <<<"$ans"
+            case ${command,,} in
+                q|quit)
+                    PM_ACTION=back; return 1 ;;
+                i|install)
+                    if (( ${#PM_MARKED[@]} )); then PM_ACTION=install; return 0; fi
+                    PM_NOTICE="Select at least one package before choosing Install marked"
+                    continue ;;
+                d|details|c|compare|r|reinstall)
+                    if [[ ! $rest =~ ^[0-9]+$ ]] || (( rest < 1 || rest > ${#plain_keys[@]} )); then
+                        PM_NOTICE="Use $command N with a numbered package row"
+                        continue
+                    fi
+                    PM_FOCUS=${plain_keys[rest-1]}
+                    case ${command,,} in
+                        d|details) PM_ACTION=details; return 0 ;;
+                        c|compare) PM_ACTION=compare; return 0 ;;
+                        *)
+                            if pm_key_installed "$PM_FOCUS"; then pm_toggle_key "$PM_FOCUS" true || true
+                            else PM_NOTICE="Reinstall applies only to installed packages; use +N to mark this package"; fi ;;
+                    esac
+                    continue ;;
+            esac
+            if [[ $ans =~ ^\+[0-9]+$ || $ans =~ ^-[0-9]+$ ]]; then
+                local index=${ans:1}
+                if (( index < 1 || index > ${#plain_keys[@]} )); then
+                    PM_NOTICE="No package has that number"
+                    continue
+                fi
+                key=${plain_keys[index-1]}; PM_FOCUS=$key
+                if [[ $ans == +* ]]; then
+                    [[ -n ${PM_MARKED[$key]:-} ]] || pm_toggle_key "$key" || true
+                else
+                    [[ -z ${PM_MARKED[$key]:-} ]] || pm_toggle_key "$key" true || true
+                fi
+                continue
+            fi
+            local valid=true start end
+            local -a tokens=()
+            IFS=',' read -ra tokens <<<"$ans"
+            for token in "${tokens[@]}"; do
+                token=${token#"${token%%[![:space:]]*}"}; token=${token%"${token##*[![:space:]]}"}
+                if [[ $token =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                    start=${BASH_REMATCH[1]}; end=${BASH_REMATCH[2]}
+                    (( start <= end )) || { local swap=$start; start=$end; end=$swap; }
+                    for (( i = start; i <= end; i++ )); do
+                        if (( i < 1 || i > ${#plain_keys[@]} )); then valid=false; break; fi
+                        PM_FOCUS=${plain_keys[i-1]}; pm_toggle_key "$PM_FOCUS" || true
+                    done
+                elif [[ $token =~ ^[0-9]+$ ]]; then
+                    i=$token
+                    if (( i < 1 || i > ${#plain_keys[@]} )); then valid=false; continue; fi
+                    PM_FOCUS=${plain_keys[i-1]}; pm_toggle_key "$PM_FOCUS" || true
+                else
+                    valid=false
+                fi
+            done
+            [[ $valid == true ]] || PM_NOTICE="Use package numbers, comma-separated numbers, or ranges such as 1-3"
+        done
+    fi
+
+    while :; do
+        keys=(); labels=(); rows=()
+        for i in "${!base_keys[@]}"; do
+            key=${base_keys[i]}; [[ $key == @* ]] && continue
+            keys+=("$key"); pm_selection_label "$key" "${base_labels[i]}"; label=$PM_LABEL
+            labels+=("$label")
+        done
+        keys+=(__details __compare)
+        labels+=("Details for ${PM_FOCUS:-current package}" "Compare packages")
+        if [[ -n $PM_FOCUS && $PM_FOCUS != @* ]] && pm_key_installed "$PM_FOCUS"; then
+            keys+=(__reinstall); labels+=("Reinstall ${PM_FOCUS#*:}")
+        fi
+        keys+=(__install __back)
+        labels+=("Install marked (${#PM_MARKED[@]})" "Back")
+        local shown_prompt=$prompt
+        [[ -n $PM_NOTICE ]] && shown_prompt+=$'\n\n'"$PM_NOTICE"
+        if [[ $frontend == zenity ]]; then
+            for i in "${!keys[@]}"; do rows+=("${keys[i]}" "${labels[i]}"); done
+            choice=$(zenity --list --title="$title" --text="$shown_prompt" --column=Key --column=Option --hide-column=1 \
+                --print-column=1 --width=760 --height=560 "${rows[@]}" 2>/dev/null) || { PM_ACTION=back; return 1; }
+        else
+            local tool=$frontend notags=--notags shown raw
+            local -a tui_rows=()
+            [[ $tool == dialog ]] && notags=--no-tags
+            for i in "${!keys[@]}"; do
+                raw=${labels[i]}
+                raw=${raw//\[✓ installed\]/PM_CHECK_INSTALLED}; raw=${raw//\[✓\]/PM_CHECKED}
+                shown=$(tui_text "$raw")
+                shown=${shown//PM_CHECK_INSTALLED/[✓ installed]}; shown=${shown//PM_CHECKED/[✓]}
+                tui_rows+=("${keys[i]}" "$shown")
+            done
+            local txt list maxh h w
+            txt=$(tui_text "$shown_prompt")
+            list=${#keys[@]}; maxh=$(( $(tput lines 2>/dev/null || echo 24) - 2 )); (( maxh < 16 )) && maxh=16
+            h=$(( list + $(printf '%s\n' "$txt" | wc -l) + 6 ))
+            (( h > maxh )) && { list=$(( list - (h - maxh) )); h=$maxh; }
+            (( list < 4 )) && list=4
+            w=$(( $(tput cols 2>/dev/null || echo 80) - 4 )); (( w > 96 )) && w=96; (( w < 60 )) && w=60
+            choice=$("$tool" --title "$(tui_text "$title")" $notags --default-item "$PM_FOCUS" --menu "$txt" "$h" "$w" "$list" \
+                "${tui_rows[@]}" 3>&1 1>&2 2>&3) || { PM_ACTION=back; return 1; }
+        fi
+        case $choice in
+            @*) PM_NOTICE="Section headings cannot be selected" ;;
+            __details) PM_ACTION=details; return 0 ;;
+            __compare) PM_ACTION=compare; return 0 ;;
+            __install)
+                if (( ${#PM_MARKED[@]} )); then PM_ACTION=install; return 0; fi
+                PM_NOTICE="Select at least one package before choosing Install marked" ;;
+            __reinstall)
+                if pm_key_installed "$PM_FOCUS"; then pm_toggle_key "$PM_FOCUS" true || true
+                else PM_NOTICE="Reinstall applies only to installed packages; activate the package row to mark it"; fi ;;
+            __back) PM_ACTION=back; return 1 ;;
+            *) PM_FOCUS=$choice; pm_toggle_key "$choice" || true ;;
+        esac
     done
 }
 
@@ -4806,12 +5222,12 @@ tui_flush() { printf '%s' "$TUI_BUF" >/dev/tty; TUI_BUF=""; }
 TUI_HOTKEYS=(1 2 3 4 5 6 7 8 9 0 a b c d e f g i m n o p r s t u v w x y z)
 declare -A TUI_HOTKEY_POS=(); for _i in "${!TUI_HOTKEYS[@]}"; do TUI_HOTKEY_POS[${TUI_HOTKEYS[_i]}]=$_i; done; unset _i
 
-tui_menu() {  # tui_menu TITLE PROMPT — uses keys[]/labels[] of ui_choose; prints the chosen key, 1 = back
-    local title=$1 prompt=$2 crumb=$1 ctx
+tui_menu() {  # single choice prints a key; opt-in multi-select returns PM_ACTION / PM_FOCUS, 1 = back
+    local title=$1 prompt=$2 crumb=$1 ctx multi_select=${multi:-false}
     [[ $title == "$APP_TITLE"* ]] && crumb=""
     ctx=${crumb:-main}
     local n=${#keys[@]} i r y sel top=0 dirty=1 ticks=0 l tok hasicon=0
-    local -a pick=() icon=() name=() sub=()
+    local -a pick=() icon=() name=() sub=() base_sub=()
     local -A rowat=() posof=()
     for i in "${!keys[@]}"; do
         l=${labels[i]} tok=${labels[i]%% *} icon[i]=""
@@ -4821,15 +5237,30 @@ tui_menu() {  # tui_menu TITLE PROMPT — uses keys[]/labels[] of ui_choose; pri
         if [[ $l == *" ("*")" ]]; then   # split at the FIRST " (": descriptions may contain parentheses themselves
             name[i]=${l%% (*}; name[i]=${name[i]%"${name[i]##*[! ]}"}; sub[i]=${l#* (}; sub[i]=${sub[i]%)}
         else name[i]=$l sub[i]=""; fi
+        if [[ $multi_select == true && ${keys[i]} != @* ]]; then
+            pm_key_installed "${keys[i]}" && [[ -n ${PM_INSTALLED_VERSION[${keys[i]}]:-} ]] && \
+                sub[i]="installed version ${PM_INSTALLED_VERSION[${keys[i]}]}${sub[i]:+ · ${sub[i]}}"
+            base_sub[i]=${sub[i]}
+        fi
         [[ ${keys[i]} == @* ]] || { posof[$i]=${#pick[@]}; pick+=("$i"); }
     done
     (( ${#pick[@]} )) || return 1
     sel=${pick[0]}
+    if [[ $multi_select == true && -n $PM_FOCUS ]]; then
+        for i in "${pick[@]}"; do [[ ${keys[i]} == "$PM_FOCUS" ]] && { sel=$i; break; }; done
+    fi
+    [[ $multi_select == true ]] && PM_FOCUS=${keys[sel]}
     (( BASH_SUBSHELL > 0 )) && trap 'tui_leave' EXIT
     tui_theme; tui_enter
 
-    local listx=3 listw ly0 ly1 vis wide px pw ph tx bg dim nm desc p
+    local listx=3 listw ly0 ly1 vis wide px pw ph tx bg dim nm desc p marker fg
+    local installed=false is_marked=false
+    local panel_key panel_text panel_total panel_visible panel_max panel_status
     while :; do
+        if [[ $multi_select == true ]]; then
+            pm_panel_pump
+            [[ $PM_PANEL_UPDATED == true ]] && dirty=1
+        fi
         if (( dirty )); then
             (( TUI_RESIZED )) && tui_size
             TUI_BUF=$'\033[0m\033[2J'; rowat=()
@@ -4851,7 +5282,19 @@ tui_menu() {  # tui_menu TITLE PROMPT — uses keys[]/labels[] of ui_choose; pri
             (( sel > 0 )) && [[ ${keys[sel-1]} == @* ]] && (( top == sel )) && top=$(( sel - 1 ))
             (( sel >= top + vis )) && top=$(( sel - vis + 1 ))
             (( top > n - vis )) && top=$(( n - vis )); (( top < 0 )) && top=0
-            tx=$(( listx + 5 )); (( hasicon )) && tx=$(( listx + 8 ))
+            if [[ $multi_select == true ]]; then
+                tx=$(( listx + 17 )); (( hasicon )) && tx=$(( listx + 20 ))
+            else
+                tx=$(( listx + 5 )); (( hasicon )) && tx=$(( listx + 8 ))
+            fi
+            if [[ $multi_select == true ]]; then
+                for i in "${pick[@]}"; do
+                    sub[i]=${base_sub[i]}
+                    if pm_parent_state "${keys[i]}"; then
+                        sub[i]+="${sub[i]:+ · }requires core: $PM_PARENT ($PM_PARENT_STATE)"
+                    fi
+                done
+            fi
             for (( r = 0; r < vis && top + r < n; r++ )); do
                 i=$(( top + r )) y=$(( ly0 + r ))
                 if [[ ${keys[i]} == @* ]]; then
@@ -4860,12 +5303,33 @@ tui_menu() {  # tui_menu TITLE PROMPT — uses keys[]/labels[] of ui_choose; pri
                     continue
                 fi
                 rowat[$y]=$i
-                bg=""; dim=$T_DIM; (( i == sel )) && { bg=$T_SEL; dim=$'\033[38;5;250m'; }
+                installed=false; is_marked=false; marker=""
+                if [[ $multi_select == true ]]; then
+                    pm_key_installed "${keys[i]}" && installed=true
+                    [[ -n ${PM_MARKED[${keys[i]}]:-} ]] && is_marked=true
+                    if [[ $installed == true ]]; then
+                        marker="[installed]"; [[ $is_marked == true ]] && marker="[✓ installed]"
+                    else
+                        marker="[ ]"; [[ $is_marked == true ]] && marker="[✓]"
+                    fi
+                fi
+                bg=""; dim=$T_DIM
+                if (( i == sel )) || [[ $multi_select == true && $is_marked == true ]]; then
+                    bg=$T_SEL; dim=$'\033[38;5;250m'
+                fi
                 tui_spaces "$listw"; tui_at "$y" "$listx"; TUI_BUF+="$bg$TUI_S"
                 (( i == sel )) && { tui_at "$y" "$listx"; TUI_BUF+="$bg"$'\033[38;5;141m▌'; }
                 p=${posof[$i]}
-                (( p < ${#TUI_HOTKEYS[@]} )) && { tui_at "$y" $(( listx + 2 )); TUI_BUF+="$bg$dim${TUI_HOTKEYS[p]}"; }
-                [[ -n ${icon[i]} ]] && { tui_at "$y" $(( listx + 5 )); TUI_BUF+="$bg${icon[i]}"; }
+                if [[ $multi_select == true ]]; then
+                    tui_at "$y" $(( listx + 2 ))
+                    if [[ $installed == true ]]; then TUI_BUF+="$bg$T_OK$marker$T_R$bg"; else TUI_BUF+="$bg$dim$marker$T_R$bg"; fi
+                else
+                    (( p < ${#TUI_HOTKEYS[@]} )) && { tui_at "$y" $(( listx + 2 )); TUI_BUF+="$bg$dim${TUI_HOTKEYS[p]}"; }
+                fi
+                if [[ -n ${icon[i]} ]]; then
+                    if [[ $multi_select == true ]]; then tui_at "$y" $(( listx + 17 )); else tui_at "$y" $(( listx + 5 )); fi
+                    TUI_BUF+="$bg${icon[i]}"
+                fi
                 nm=${name[i]}
                 local avail=$(( listx + listw - tx - 1 )) sw=""
                 if [[ $nm =~ ^(.+):\ (on|off)$ ]]; then
@@ -4875,7 +5339,12 @@ tui_menu() {  # tui_menu TITLE PROMPT — uses keys[]/labels[] of ui_choose; pri
                 fi
                 tui_fit "$nm" "$avail"; nm=$TUI_S
                 tui_at "$y" "$tx"
-                if (( i == sel )); then TUI_BUF+="$bg$T_B$nm$T_R$bg"; else TUI_BUF+="$T_FG$nm$T_R"; fi
+                if [[ $multi_select != true ]]; then
+                    if (( i == sel )); then TUI_BUF+="$bg$T_B$nm$T_R$bg"; else TUI_BUF+="$T_FG$nm$T_R"; fi
+                else
+                    fg=$T_FG; [[ $installed == true ]] && fg=$T_OK
+                    if (( i == sel )) || [[ $is_marked == true ]]; then TUI_BUF+="$bg$T_B$fg$nm$T_R$bg"; else TUI_BUF+="$fg$nm$T_R"; fi
+                fi
                 if [[ -n ${sub[i]} && -z $sw ]] && (( avail - ${#nm} > 8 )); then
                     tui_fit "${sub[i]}" $(( avail - ${#nm} - 3 )); TUI_BUF+="$bg$dim   $TUI_S"
                 fi
@@ -4893,48 +5362,143 @@ tui_menu() {  # tui_menu TITLE PROMPT — uses keys[]/labels[] of ui_choose; pri
             desc=${TUI_DESC[$ctx:${keys[sel]}]:-${sub[sel]}}
             if (( wide )); then  # details panel
                 px=$(( listx + listw + 4 )) pw=$(( TUI_COLS - listx - listw - 5 )) ph=$vis
-                (( ph > 16 )) && ph=16
+                if [[ $multi_select != true ]] && (( ph > 16 )); then ph=16; fi
+                panel_text=$desc
+                if [[ $multi_select == true ]]; then
+                    panel_key=${keys[sel]}
+                    pm_panel_select "$panel_key"
+                    if [[ -n ${PM_PANEL_TEXT[$panel_key]+present} ]]; then
+                        panel_text=${PM_PANEL_TEXT[$panel_key]}
+                    else
+                        if pm_panel_summary "$panel_key" && [[ -n ${PM_PANEL_SUMMARY[$panel_key]} ]]; then
+                            panel_text=${PM_PANEL_SUMMARY[$panel_key]}
+                        fi
+                        if [[ -n ${PM_PANEL_FAILED[$panel_key]+present} ]]; then
+                            panel_text+=$'\n\nComplete details are unavailable; Enter opens the details fallback.'
+                        else
+                            panel_text+=$'\n\nLoading complete details in the background…'
+                        fi
+                    fi
+                fi
                 tui_box "$ly0" "$px" "$ph" "$pw" "$T_LINE"
                 tui_at $(( ly0 + 1 )) $(( px + 3 ))
                 [[ -n ${icon[sel]} ]] && TUI_BUF+="${icon[sel]}  "
                 tui_fit "${name[sel]}" $(( pw - 10 )); TUI_BUF+="$T_B$TUI_S$T_R"
-                tui_wrap $(( pw - 6 )) "$desc"
-                for (( r = 0; r < ${#TUI_LINES[@]} && r < ph - 6; r++ )); do
-                    tui_at $(( ly0 + 3 + r )) $(( px + 3 )); TUI_BUF+="$T_FG${TUI_LINES[r]}$T_R"
+                tui_wrap $(( pw - 6 )) "$panel_text"
+                panel_total=${#TUI_LINES[@]}; panel_visible=$(( ph - 6 )); (( panel_visible < 1 )) && panel_visible=1
+                PM_PANEL_PAGE=$panel_visible
+                panel_max=$(( panel_total - panel_visible )); (( panel_max < 0 )) && panel_max=0
+                (( PM_PANEL_OFFSET > panel_max )) && PM_PANEL_OFFSET=$panel_max
+                (( PM_PANEL_OFFSET < 0 )) && PM_PANEL_OFFSET=0
+                for (( r = 0; r < panel_visible && PM_PANEL_OFFSET + r < panel_total; r++ )); do
+                    tui_at $(( ly0 + 3 + r )) $(( px + 3 )); TUI_BUF+="$T_FG${TUI_LINES[PM_PANEL_OFFSET+r]}$T_R"
                 done
-                tui_at $(( ly0 + ph - 2 )) $(( px + 3 )); TUI_BUF+="${T_DIM}Enter or click to open$T_R"
+                tui_at $(( ly0 + ph - 2 )) $(( px + 3 ))
+                if [[ $multi_select != true ]]; then
+                    TUI_BUF+="${T_DIM}Enter or click to open$T_R"
+                else
+                    if (( panel_max == 0 )); then panel_status="All details shown"
+                    elif (( PM_PANEL_OFFSET == 0 )); then panel_status="Details: top"
+                    elif (( PM_PANEL_OFFSET == panel_max )); then panel_status="Details: bottom"
+                    else panel_status="Details: $(( PM_PANEL_OFFSET + 1 ))–$(( PM_PANEL_OFFSET + panel_visible ))/$panel_total"; fi
+                    tui_fit "$panel_status · [ ] scroll · Enter details" $(( pw - 6 ))
+                    TUI_BUF+="$T_DIM$TUI_S$T_R"
+                fi
             elif [[ -n $desc ]]; then
                 tui_fit "$desc" $(( TUI_COLS - 6 )); tui_at $(( TUI_ROWS - 1 )) 4; TUI_BUF+="$T_DIM$TUI_S$T_R"
             fi
+            if [[ $multi_select == true && -n $PM_NOTICE ]]; then
+                tui_fit "$PM_NOTICE" $(( TUI_COLS - 6 )); tui_at $(( TUI_ROWS - 1 )) 4; TUI_BUF+="$T_WARN$TUI_S$T_R"
+            fi
             local back=Back; [[ -z $crumb ]] && back=Quit
             local hk="1-${#pick[@]}"; (( ${#pick[@]} > 9 )) && hk="1-9 0 a-z"
-            tui_fit "↑↓ move · Enter open · $hk pick · Esc ${back,,}" $(( TUI_COLS - 24 ))
+            if [[ $multi_select == true ]]; then
+                tui_fit "Space mark · Enter details · c compare · r reinstall · i install" $(( TUI_COLS - 24 ))
+            else
+                tui_fit "↑↓ move · Enter open · $hk pick · Esc ${back,,}" $(( TUI_COLS - 24 ))
+            fi
             tui_at "$TUI_ROWS" 3; TUI_BUF+="$T_DIM$TUI_S$T_R"
-            tui_buttons "$TUI_ROWS" $(( TUI_COLS - 1 )) -1 Open "$back"
+            local open=Open; [[ $multi_select == true ]] && open=Details
+            tui_buttons "$TUI_ROWS" $(( TUI_COLS - 1 )) -1 "$open" "$back"
             tui_flush; dirty=0
         fi
         tui_key 1
         local step=0
         case $K in
             tick)    tui_size && dirty=1; (( ++ticks % 3 == 0 )) && dirty=1 ;;
-            up|ch:k|btab|wheelup)     step=-1 ;;
-            down|ch:j|tab|wheeldown)  step=1 ;;
+            up|ch:k|btab)     step=-1 ;;
+            down|ch:j|tab)  step=1 ;;
+            wheelup|wheeldown)
+                if [[ $multi_select == true ]] && (( wide && MX >= px )); then
+                    [[ $K == wheelup ]] && (( PM_PANEL_OFFSET -= 3 )) || (( PM_PANEL_OFFSET += 3 ))
+                    dirty=1
+                else
+                    [[ $K == wheelup ]] && step=-1 || step=1
+                fi ;;
             pgup)    step=-5 ;;
             pgdn)    step=5 ;;
             home)    sel=${pick[0]}; dirty=1 ;;
             end)     sel=${pick[-1]}; dirty=1 ;;
-            enter|space|right|ch:l) break ;;
-            esc|left|cancel|bksp|ch:q|ch:Q|ch:h) tui_leave; return 1 ;;
-            move)    [[ -n ${rowat[$MY]:-} && ${rowat[$MY]} != "$sel" ]] && { sel=${rowat[$MY]}; dirty=1; } ;;
-            click)   if [[ -n ${rowat[$MY]:-} ]]; then sel=${rowat[$MY]}; break
-                     elif tui_hit; then (( TUI_HIT == 0 )) && break; tui_leave; return 1
-                     elif (( wide && MX >= px && MY >= ly0 && MY < ly0 + ph )); then break; fi ;;
-            ch:?)    p=${K#ch:}; p=${p,,}; p=${TUI_HOTKEY_POS[$p]:-}   # letters work in either case
-                     [[ -n $p ]] && (( p < ${#pick[@]} )) && { sel=${pick[p]}; break; } ;;
+            space)
+                if [[ $multi_select != true ]]; then break; fi
+                PM_FOCUS=${keys[sel]}
+                if pm_toggle_key "$PM_FOCUS"; then
+                    p=${posof[$sel]}; (( p < ${#pick[@]} - 1 )) && sel=${pick[p+1]}
+                    PM_FOCUS=${keys[sel]}
+                fi
+                dirty=1 ;;
+            enter|right|ch:l)
+                if [[ $multi_select == true ]]; then
+                    PM_ACTION=details; PM_FOCUS=${keys[sel]}; tui_leave; return 0
+                fi
+                break ;;
+            esc|left|cancel|bksp|ch:q|ch:Q|ch:h)
+                [[ $multi_select == true ]] && PM_ACTION=back
+                tui_leave; return 1 ;;
+            move)    [[ -n ${rowat[$MY]:-} && ${rowat[$MY]} != "$sel" ]] && { sel=${rowat[$MY]}; PM_FOCUS=${keys[sel]}; dirty=1; } ;;
+            click)   if [[ -n ${rowat[$MY]:-} ]]; then
+                         sel=${rowat[$MY]}; PM_FOCUS=${keys[sel]}
+                         if [[ $multi_select == true ]]; then PM_ACTION=details; tui_leave; return 0; fi
+                         break
+                     elif tui_hit; then
+                         if (( TUI_HIT == 0 )); then
+                             if [[ $multi_select == true ]]; then PM_ACTION=details; PM_FOCUS=${keys[sel]}; tui_leave; return 0; fi
+                             break
+                         fi
+                         [[ $multi_select == true ]] && PM_ACTION=back
+                         tui_leave; return 1
+                     elif (( wide && MX >= px && MY >= ly0 && MY < ly0 + ph )); then
+                         if [[ $multi_select == true ]]; then PM_ACTION=details; PM_FOCUS=${keys[sel]}; tui_leave; return 0; fi
+                         break
+                     fi ;;
+            ch:?)    p=${K#ch:}; p=${p,,}
+                     if [[ $multi_select == true ]]; then
+                         case $p in
+                             ']') (( PM_PANEL_OFFSET += PM_PANEL_PAGE )); dirty=1; continue ;;
+                             '[') (( PM_PANEL_OFFSET -= PM_PANEL_PAGE )); dirty=1; continue ;;
+                             c) PM_ACTION=compare; PM_FOCUS=${keys[sel]}; tui_leave; return 0 ;;
+                             i)
+                                 if (( ${#PM_MARKED[@]} )); then PM_ACTION=install; PM_FOCUS=${keys[sel]}; tui_leave; return 0; fi
+                                 PM_NOTICE="Select at least one package before choosing Install marked"; dirty=1
+                                 continue ;;
+                             r)
+                                 PM_FOCUS=${keys[sel]}
+                                 if pm_key_installed "$PM_FOCUS"; then pm_toggle_key "$PM_FOCUS" true || true
+                                 else PM_NOTICE="Reinstall applies only to installed packages; use Space to mark this package"; fi
+                                 dirty=1
+                                 continue ;;
+                         esac
+                     fi
+                     p=${TUI_HOTKEY_POS[$p]:-}   # letters work in either case
+                     [[ -n $p ]] && (( p < ${#pick[@]} )) && {
+                         sel=${pick[p]}
+                         if [[ $multi_select == true ]]; then PM_FOCUS=${keys[sel]}; dirty=1; else break; fi
+                     } ;;
         esac
         if (( step )); then
             p=$(( ${posof[$sel]} + step )); (( p < 0 )) && p=0; (( p >= ${#pick[@]} )) && p=$(( ${#pick[@]} - 1 ))
             sel=${pick[p]}; dirty=1
+            [[ $multi_select == true ]] && PM_FOCUS=${keys[sel]}
         fi
     done
     tui_leave
@@ -5806,14 +6370,1508 @@ for r in d.get("results", []):
         print("%s|%s|%s|%.2f|%s|%s" % (r["Name"], r.get("Version", ""), r.get("NumVotes", 0),
               r.get("Popularity", 0) or 0, "1" if r.get("OutOfDate") else "", desc))
     else:
-        for k in ("Name", "Version", "Description", "Maintainer", "NumVotes", "Popularity", "OutOfDate", "LastModified", "URL"):
+        for k in ("Name", "Version", "Description", "Maintainer", "NumVotes", "Popularity", "OutOfDate", "LastModified", "FirstSubmitted", "PackageBase", "URL"):
             print("%s=%s" % (k, r.get(k) if r.get(k) is not None else ""))
-        for k in ("Depends", "MakeDepends", "CheckDepends", "OptDepends"):
+        for k in ("Depends", "MakeDepends", "CheckDepends", "OptDepends", "License", "Keywords"):
             print("%s=%s" % (k, "\t".join(r.get(k, []))))
 ' "$2" <<<"$out"
 }
 
 pkg_name_of() { local d=${1%%:*}; d=${d%%[<>=]*}; printf '%s' "$d"; }   # "foo>=1.2: desc" -> foo
+
+read -r -d '' PM_PACKAGE_LIB_PY <<'PYEOF'
+import copy
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+
+PACKAGE_FIELDS = {
+    "name": "", "package_base": "", "source": "", "repository": "",
+    "version": "", "description": "", "installed": False,
+    "installed_version": "", "votes": None, "popularity": None,
+    "user_share": None, "updated": None, "first_submitted": None,
+    "out_of_date": None, "download_size": None, "installed_size": None,
+    "depends": [], "make_depends": [], "check_depends": [],
+    "optional_depends": [], "architectures": [], "licenses": [],
+    "maintainer": None, "packager": None, "url": "",
+    "provides": [], "conflicts": [], "groups": [], "keywords": [],
+    "category": "app", "parent": "", "alt": "", "variant": "source",
+    "addons": [],
+}
+
+def new_package(name):
+    record = copy.deepcopy(PACKAGE_FIELDS)
+    record["name"] = name
+    record["package_base"] = name
+    return record
+
+def size_bytes(value):
+    if not value or value == "None":
+        return None
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*(B|KiB|MiB|GiB|TiB)", value.strip())
+    if not match:
+        raise ValueError("unknown pacman size: " + value)
+    factor = {"B": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3, "TiB": 1024**4}
+    return round(float(match.group(1)) * factor[match.group(2)])
+
+def normalize_aur(raw, installed=False):
+    record = new_package(raw["Name"])
+    record.update({
+        "package_base": raw.get("PackageBase") or raw["Name"], "source": "aur",
+        "repository": "AUR", "version": raw.get("Version") or "",
+        "description": raw.get("Description") or "", "installed": installed,
+        "votes": raw.get("NumVotes"), "popularity": raw.get("Popularity"),
+        "updated": raw.get("LastModified") or None, "first_submitted": raw.get("FirstSubmitted") or None,
+        "out_of_date": raw.get("OutOfDate"), "depends": list(raw.get("Depends", [])),
+        "make_depends": list(raw.get("MakeDepends", [])),
+        "check_depends": list(raw.get("CheckDepends", [])),
+        "optional_depends": list(raw.get("OptDepends", [])),
+        "licenses": list(raw.get("License", [])), "maintainer": raw.get("Maintainer"),
+        "url": raw.get("URL") or "", "provides": list(raw.get("Provides", [])),
+        "conflicts": list(raw.get("Conflicts", [])), "groups": list(raw.get("Groups", [])),
+        "keywords": list(raw.get("Keywords", [])),
+    })
+    record["variant"] = "binary" if record["name"].endswith("-bin") else (
+        "vcs" if record["name"].endswith(("-git", "-svn", "-hg", "-bzr")) else "source")
+    return record
+
+def parse_pacman_si(text, installed=False):
+    fields = {}
+    optional = []
+    in_optional = False
+    for line in text.splitlines():
+        match = re.match(r"^([A-Za-z][A-Za-z ]+?)\s*: (.*)$", line)
+        if match:
+            key, value = match.group(1), match.group(2)
+            fields[key] = value
+            in_optional = key == "Optional Deps" and value != "None"
+            if in_optional:
+                optional.append(value)
+        elif in_optional and line.startswith(" "):
+            optional.append(line.strip())
+        else:
+            in_optional = False
+    if not fields and not text.strip():
+        return new_package("")
+    if "Name" not in fields:
+        raise ValueError("pacman metadata has no Name")
+    record = new_package(fields["Name"])
+    split = lambda key: [] if fields.get(key, "None") == "None" else fields[key].split()
+    record.update({
+        "source": "repo", "repository": fields.get("Repository", ""),
+        "version": fields.get("Version", ""), "description": fields.get("Description", ""),
+        "installed": installed, "depends": split("Depends On"),
+        "optional_depends": optional, "architectures": split("Architecture"),
+        "licenses": split("Licenses"), "url": "" if fields.get("URL") == "None" else fields.get("URL", ""),
+        "provides": split("Provides"), "conflicts": split("Conflicts With"),
+        "groups": split("Groups"), "packager": fields.get("Packager"),
+        "download_size": size_bytes(fields.get("Download Size")),
+        "installed_size": size_bytes(fields.get("Installed Size")),
+        "make_depends": None, "check_depends": None,
+        "_unavailable": ["make_depends", "check_depends"],
+    })
+    if fields.get("Build Date"):
+        record["updated"] = int(time.mktime(time.strptime(fields["Build Date"], "%a %b %d %H:%M:%S %Y")))
+    return record
+
+def parse_srcinfo(text, record):
+    result = dict(record)
+    architectures = []
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        if key == "arch" and value:
+            architectures.append(value)
+    result["architectures"] = sorted(set(architectures))
+    return result
+
+def format_date(timestamp):
+    if timestamp is None:
+        return "Not available"
+    return time.strftime("%Y-%m-%d", time.localtime(timestamp))
+
+def format_size(value):
+    if value is None:
+        return "Not available"
+    amount = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if amount < 1024 or unit == "TiB":
+            return "%d %s" % (amount, unit) if unit == "B" else "%.1f %s" % (amount, unit)
+        amount /= 1024
+    raise AssertionError("unreachable size unit")
+
+def join_or(values, fallback):
+    return ", ".join(values) if values else fallback
+
+VCS_SUFFIXES = ("-git", "-svn", "-hg", "-bzr")
+VARIANT_WINDOW = 30 * 86400
+
+
+def variant_family(record):
+    base = record.get("package_base") or record.get("name") or ""
+    for suffix in ("-bin",) + VCS_SUFFIXES:
+        if base.endswith(suffix):
+            return base[:-len(suffix)]
+    return base
+
+
+STOP_WORDS = frozenset({
+    "program", "application", "tool", "utility", "package", "linux", "arch",
+    "free", "open", "source", "for", "with", "and", "the", "that", "this",
+})
+
+
+def significant_words(text):
+    return {
+        word for word in re.findall(r"[a-z0-9][a-z0-9+._-]+", text.lower())
+        if len(word) > 1 and word not in STOP_WORDS
+    }
+
+
+def similar_packages(target, candidates):
+    target_family = variant_family(target)
+    target_words = significant_words(target.get("description", ""))
+    target_keywords = set(target.get("keywords", []) or [])
+    target_groups = set(target.get("groups", []) or [])
+    scored = []
+    seen = set()
+    for candidate in candidates:
+        candidate_key = variant_record_key(candidate)
+        if candidate_key in seen:
+            continue
+        seen.add(candidate_key)
+        if candidate["name"] == target["name"] or variant_family(candidate) == target_family:
+            continue
+        if candidate.get("category") in ("lib", "other", "documentation", "docs", "doc", "lang", "help"):
+            continue
+        shared_keywords = sorted(target_keywords & set(candidate.get("keywords", []) or []))
+        shared_groups = sorted(target_groups & set(candidate.get("groups", []) or []))
+        shared_words = sorted(target_words & significant_words(candidate.get("description", "")))
+        score = 6 * len(shared_keywords) + 4 * len(shared_groups) + min(6, 2 * len(shared_words))
+        score += int(candidate.get("category") == target.get("category"))
+        if score < 6:
+            continue
+        reasons = (["Shared keyword: " + ", ".join(shared_keywords)] if shared_keywords else
+                   ["Same group: " + ", ".join(shared_groups)] if shared_groups else
+                   ["Shared description terms: " + ", ".join(shared_words)])
+        row = dict(candidate)
+        row["reason"] = reasons[0]
+        row["similarity_score"] = score
+        scored.append(row)
+    scored.sort(key=lambda row: (-row["similarity_score"], -(row.get("updated") or 0),
+                                -(row.get("votes") or 0), -(row.get("popularity") or 0), row["name"]))
+    return scored[:5]
+
+
+def similarity_search_query(target, candidates):
+    keywords = sorted(set(target.get("keywords", []) or []) - STOP_WORDS)
+    if not keywords:
+        return ""
+    candidate_keywords = [set(candidate.get("keywords", []) or []) for candidate in candidates]
+    shared = {
+        keyword: sum(keyword in values for values in candidate_keywords)
+        for keyword in keywords
+    }
+    return sorted(keywords, key=lambda keyword: (-shared[keyword], -len(keyword), keyword))[0]
+
+
+def variant_record_key(record):
+    return record.get("source", "") + ":" + record.get("name", "")
+
+
+def is_vcs_variant(record):
+    return record.get("name", "").endswith(VCS_SUFFIXES)
+
+
+def variant_kind(record):
+    if record.get("source") == "repo":
+        return "official"
+    if record.get("name", "").endswith("-bin"):
+        return "binary repackaging (inferred from -bin)"
+    for suffix in VCS_SUFFIXES:
+        if record.get("name", "").endswith(suffix):
+            return "VCS/development (inferred from %s)" % suffix
+    return "source/other — verify PKGBUILD"
+
+
+def provided_names(record):
+    return {
+        dependency_name(item)
+        for item in (record.get("provides") or [])
+        if dependency_name(item)
+    }
+
+
+def variant_relation(first, second):
+    first_base = first.get("package_base") or ""
+    second_base = second.get("package_base") or ""
+    if first_base and first_base == second_base:
+        return "strong", "shared PackageBase " + first_base
+    first_provides = provided_names(first)
+    second_provides = provided_names(second)
+    shared = sorted(first_provides & second_provides)
+    if shared:
+        return "strong", "intersecting Provides: " + ", ".join(shared)
+    provided = sorted(
+        ({first.get("name", "")} & second_provides)
+        | ({second.get("name", "")} & first_provides)
+    )
+    if provided:
+        return "strong", "Provides links package identity: " + ", ".join(provided)
+    for record, other in ((first, second), (second, first)):
+        alternate = record.get("alt") or ""
+        if alternate and alternate in (
+            other.get("name"), other.get("package_base"), variant_family(other)
+        ):
+            return "strong", "classifier alt evidence: " + alternate
+        parent = record.get("parent") or ""
+        if (parent and record.get("category") not in ("plugin", "lang")
+                and parent in (other.get("name"), other.get("package_base"))):
+            return "strong", "classifier parent evidence: " + parent
+    if variant_family(first) and variant_family(first) == variant_family(second):
+        return "weak", "normalized variant name: " + variant_family(first)
+    return "", ""
+
+
+def variant_candidates(records, target):
+    ordered = list(records)
+    target_key = target if isinstance(target, str) else variant_record_key(target)
+    if not any(variant_record_key(record) == target_key for record in ordered):
+        return []
+    included = {target_key}
+    changed = True
+    while changed:
+        changed = False
+        for first in ordered:
+            first_key = variant_record_key(first)
+            if first_key in included:
+                continue
+            for second in ordered:
+                if variant_record_key(second) not in included:
+                    continue
+                strength, _ = variant_relation(first, second)
+                if strength:
+                    included.add(first_key)
+                    changed = True
+                    break
+    return [record for record in ordered if variant_record_key(record) in included]
+
+
+def identity_confidence(records, target=None):
+    ordered = list(records)
+    parents = list(range(len(ordered)))
+
+    def find(index):
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(first, second):
+        first_root = find(first)
+        second_root = find(second)
+        if first_root != second_root:
+            parents[second_root] = first_root
+
+    for first_index, first in enumerate(ordered):
+        for second_index in range(first_index + 1, len(ordered)):
+            strength, _ = variant_relation(first, ordered[second_index])
+            if strength == "strong":
+                union(first_index, second_index)
+    roots = [find(index) for index in range(len(ordered))]
+    allowed = None
+    if target is not None:
+        target_key = target if isinstance(target, str) else variant_record_key(target)
+        for index, record in enumerate(ordered):
+            if variant_record_key(record) == target_key:
+                if len(ordered) == 1 or roots.count(roots[index]) > 1:
+                    allowed = roots[index]
+                break
+    elif len(set(roots)) == 1 and roots:
+        allowed = roots[0]
+    return {
+        variant_record_key(record): allowed is not None and roots[index] == allowed
+        for index, record in enumerate(ordered)
+    }
+
+
+def actual_timestamp(record):
+    value = record.get("updated")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
+def comparison_list(record, key, empty="None declared"):
+    value = record.get(key)
+    if key in record.get("_unavailable", ()) or value is None:
+        return "Not available"
+    return ", ".join(value) if value else empty
+
+
+def comparison_scalar(record, key):
+    value = record.get(key)
+    if key in record.get("_unavailable", ()) or value is None or value == "":
+        return "Not available"
+    return str(value)
+
+
+def comparison_maintenance(record):
+    unavailable = set(record.get("_unavailable", ()))
+    if record.get("source") == "repo":
+        if "packager" in unavailable:
+            return "Not available"
+        return record.get("packager") or "Not available"
+    if "maintainer" in unavailable:
+        return "Not available"
+    return record.get("maintainer") or "Orphaned — no maintainer"
+
+
+def out_of_date_text(record):
+    value = record.get("out_of_date")
+    if record.get("source") == "repo":
+        return "Not tracked by pacman"
+    unavailable = set(record.get("_unavailable", ()))
+    if "out_of_date" in unavailable or (record.get("source") == "aur" and "maintainer" in unavailable):
+        return "Not available"
+    if not value:
+        return "Not out of date"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return "Out of date since " + format_date(value)
+    return "Out of date"
+
+
+def comparison_row_text(row):
+    lines = [
+        "Candidate: " + row["key"],
+        "Source/repository: " + row["source"] + " / " + row["repository_text"],
+        "Variant kind: " + row["kind"],
+        "Version: " + row["version_text"],
+        "Installed: " + row["installed_text"],
+        row["update_label"] + ": " + row["update_date"],
+        "First submitted to AUR: " + row["first_submitted_date"],
+        "AUR votes: " + row["votes_text"],
+        "AUR popularity: " + row["popularity_text"],
+        "pkgstats popularity: " + row["user_share_text"],
+        "Maintainer / packager: " + row["maintenance"],
+        "Out-of-date state: " + row["out_of_date_text"],
+        "Architecture: " + row["architectures_text"],
+        "Download size: " + row["download_size_text"],
+        "Installed size: " + row["installed_size_text"],
+        "Direct/runtime requirements: " + row["depends_text"],
+        "Build-only requirements: " + row["build_only_text"],
+        "Optional requirements: " + row["optional_depends_text"],
+        "Package base: " + row["package_base_text"],
+        "Provides: " + row["provides_text"],
+        "Conflicts metadata: " + row["conflicts_text"],
+    ]
+    if row["conflict_warning"]:
+        lines.append(row["conflict_warning"])
+    lines.extend([
+        "Warnings: " + ("; ".join(row["warnings"]) if row["warnings"] else "None"),
+        "Identity evidence: " + row["identity_evidence"],
+    ])
+    return "\n".join(lines)
+
+
+def format_build_only(record, build_only):
+    if record.get("source") == "repo":
+        if build_only:
+            return ", ".join(build_only) + "; additional make/check dependencies: Not tracked by pacman"
+        return "Not tracked by pacman"
+    parts = []
+    if build_only:
+        parts.append(", ".join(build_only))
+    unavailable = set(record.get("_unavailable", ()))
+    for key, label in (
+        ("make_depends", "make dependencies"),
+        ("check_depends", "check dependencies"),
+    ):
+        if key in unavailable or record.get(key) is None:
+            parts.append(label + ": Not available")
+    if parts:
+        return "; ".join(parts)
+    return "None declared"
+
+
+def build_comparison_rows(records, target=None):
+    ordered = list(records)
+    confidence = identity_confidence(ordered, target)
+    rows = []
+    for index, record in enumerate(ordered):
+        key = variant_record_key(record)
+        source = record.get("source", "")
+        update_label = "Package build date" if source == "repo" else "AUR recipe update"
+        first_submitted = record.get("first_submitted")
+        if source == "repo":
+            first_submitted_date = "Not tracked by pacman"
+            votes_text = "Not used for official packages"
+            popularity_text = "Not used for official packages"
+            download_size_text = format_size(record.get("download_size"))
+            installed_size_text = format_size(record.get("installed_size"))
+        else:
+            first_submitted_date = format_date(first_submitted)
+            votes = record.get("votes")
+            popularity = record.get("popularity")
+            votes_text = "Not available" if votes is None else str(votes)
+            popularity_text = "Not available" if popularity is None else str(popularity)
+            download_size_text = "Not published by AUR"
+            installed_size_text = "Unknown until built"
+        user_share = record.get("user_share")
+        installed = bool(record.get("installed"))
+        installed_version = record.get("installed_version")
+        installed_text = "yes" if installed else "no"
+        if installed:
+            installed_text += "; installed version " + (installed_version or "Not available")
+        build_only = list(record.get("make_depends") or []) + [
+            item for item in (record.get("check_depends") or [])
+            if item not in (record.get("make_depends") or [])
+        ]
+        warnings = []
+        if source == "aur" and "maintainer" not in record.get("_unavailable", ()) and not record.get("maintainer"):
+            warnings.append("Orphaned — no maintainer")
+        if record.get("out_of_date"):
+            warnings.append(out_of_date_text(record))
+        if is_vcs_variant(record):
+            warnings.append("VCS/development build; not a maintained stable recommendation")
+        row = dict(record)
+        row.update({
+            "key": key,
+            "kind": variant_kind(record),
+            "repository_text": comparison_scalar(record, "repository"),
+            "version_text": comparison_scalar(record, "version"),
+            "installed": installed,
+            "installed_text": installed_text,
+            "update_label": update_label,
+            "update_date": format_date(actual_timestamp(record)),
+            "first_submitted_date": first_submitted_date,
+            "votes_text": votes_text,
+            "popularity_text": popularity_text,
+            "user_share_text": "Not available" if user_share is None else str(user_share),
+            "maintenance": comparison_maintenance(record),
+            "out_of_date_text": out_of_date_text(record),
+            "architectures_text": comparison_list(record, "architectures", "Not available"),
+            "download_size_text": download_size_text,
+            "installed_size_text": installed_size_text,
+            "depends_text": comparison_list(record, "depends"),
+            "build_only": build_only,
+            "build_only_text": format_build_only(record, build_only),
+            "optional_depends_text": comparison_list(record, "optional_depends"),
+            "package_base_text": comparison_scalar(record, "package_base"),
+            "provides_text": comparison_list(record, "provides"),
+            "conflicts_text": comparison_list(record, "conflicts"),
+            "conflicts_with": [],
+            "conflict_warning": "",
+            "warnings": warnings,
+            "identity_confident": confidence[key],
+            "identity_evidence": "Sole candidate" if len(ordered) == 1 else "Only ambiguous normalized-name evidence",
+            "identity_has_strong_link": False,
+        })
+        rows.append(row)
+
+    conflict_notes = {row["key"]: [] for row in rows}
+    for left_index, left in enumerate(ordered):
+        left_conflicts = {dependency_name(item) for item in (left.get("conflicts") or [])}
+        left_identities = {left.get("name", "")} | provided_names(left)
+        for right_index in range(left_index + 1, len(ordered)):
+            right = ordered[right_index]
+            right_conflicts = {dependency_name(item) for item in (right.get("conflicts") or [])}
+            right_identities = {right.get("name", "")} | provided_names(right)
+            left_declares = bool(left_conflicts & right_identities)
+            right_declares = bool(right_conflicts & left_identities)
+            if not left_declares and not right_declares:
+                continue
+            left_key = variant_record_key(left)
+            right_key = variant_record_key(right)
+            rows[left_index]["conflicts_with"].append(right_key)
+            rows[right_index]["conflicts_with"].append(left_key)
+            declarers = []
+            if left_declares:
+                declarers.append(left_key)
+            if right_declares:
+                declarers.append(right_key)
+            conflict_notes[left_key].append(
+                "Conflicts with: %s (declared by %s)" % (right_key, ", ".join(declarers))
+            )
+            conflict_notes[right_key].append(
+                "Conflicts with: %s (declared by %s)" % (left_key, ", ".join(declarers))
+            )
+
+    for index, row in enumerate(rows):
+        evidence = []
+        for other_index, other in enumerate(ordered):
+            if index == other_index:
+                continue
+            strength, description = variant_relation(ordered[index], other)
+            if strength == "strong":
+                evidence.append(description)
+        row["identity_has_strong_link"] = bool(evidence)
+        if row["identity_confident"] and evidence:
+            row["identity_evidence"] = "; ".join(dict.fromkeys(evidence))
+        elif evidence:
+            row["identity_evidence"] = (
+                "Separate strong component; no strong-only path from the explicit target"
+                if target is not None else
+                "Separate strong component; explicit target evidence is required"
+            )
+        row["conflict_warning"] = "\n".join(conflict_notes[row["key"]])
+        row["warnings"].extend(conflict_notes[row["key"]])
+        row["text"] = comparison_row_text(row)
+    return rows
+
+
+def recommendation_metrics(record):
+    if record.get("source") == "repo":
+        votes = "votes not used for official packages"
+        popularity = "AUR popularity not used for official packages"
+    else:
+        votes = "votes " + ("Not available" if record.get("votes") is None else str(record.get("votes")))
+        popularity = "AUR popularity " + (
+            "Not available" if record.get("popularity") is None else str(record.get("popularity"))
+        )
+    user_share = record.get("user_share")
+    pkgstats = "pkgstats " + ("Not available" if user_share is None else str(user_share))
+    return "; ".join((votes, popularity, pkgstats))
+
+
+def recommend_variant(records, now, development=False, target=None):
+    ordered = list(records)
+    rows = build_comparison_rows(ordered, target)
+    if not ordered:
+        return {"recommended_key": "", "reason": "No comparable variants", "comparison_rows": []}
+    by_key = {row["key"]: row for row in rows}
+    confident = [record for record in ordered if by_key[variant_record_key(record)]["identity_confident"]]
+    if len(ordered) > 1 and not confident:
+        if any(row["identity_has_strong_link"] for row in rows):
+            reason = (
+                "Variant identity is ambiguous across separate strong components; "
+                "no recommendation without a strong-only path from the explicit target"
+            )
+        else:
+            reason = (
+                "Variant identity is ambiguous: only normalized-name evidence links "
+                "these candidates; no recommendation"
+            )
+        return {
+            "recommended_key": "",
+            "reason": reason,
+            "comparison_rows": rows,
+        }
+
+    maintained = [
+        record for record in confident
+        if bool(record.get("maintainer") or record.get("packager"))
+        and not record.get("out_of_date")
+    ]
+    stable = [record for record in maintained if not is_vcs_variant(record)]
+    if development:
+        stable = [record for record in maintained if is_vcs_variant(record)]
+    if not stable:
+        if len(confident) == 1 and is_vcs_variant(confident[0]) and confident[0] in maintained:
+            chosen = confident[0]
+            reason = (
+                "VCS/development variant from %s; recommended only because it is the sole candidate; "
+                "choose development builds explicitly; Last update %s; %s"
+                % (
+                    chosen.get("repository") or "AUR",
+                    format_date(actual_timestamp(chosen)),
+                    recommendation_metrics(chosen),
+                )
+            )
+            return {
+                "recommended_key": variant_record_key(chosen),
+                "reason": reason,
+                "comparison_rows": rows,
+            }
+        return {
+            "recommended_key": "",
+            "reason": "No maintained stable recommendation; choose a development build explicitly",
+            "comparison_rows": rows,
+        }
+
+    timed = [record for record in stable if actual_timestamp(record) is not None]
+    official = []
+    recent = stable
+    newest = None
+    if timed:
+        newest = max(actual_timestamp(record) for record in timed)
+        recent = [
+            record for record in timed
+            if newest - actual_timestamp(record) <= VARIANT_WINDOW
+        ]
+        official = [record for record in recent if record.get("source") == "repo"]
+    candidates = official or recent
+
+    def rank(record):
+        votes = record.get("votes")
+        popularity = record.get("popularity")
+        updated = actual_timestamp(record)
+        return (
+            votes is not None, votes if votes is not None else 0,
+            popularity is not None, popularity if popularity is not None else 0,
+            updated is not None, updated if updated is not None else 0,
+        )
+
+    chosen = max(candidates, key=rank)
+    source = chosen.get("repository") or ("official repositories" if chosen.get("source") == "repo" else "AUR")
+    if development:
+        reason = "VCS/development variant from %s; explicit development request" % source
+    elif chosen.get("source") == "repo":
+        reason = "Official package from %s" % source
+    else:
+        reason = "maintained stable variant from %s" % source
+    reason += "; Last update %s (%s); %s" % (
+        format_date(actual_timestamp(chosen)),
+        "Package build date" if chosen.get("source") == "repo" else "AUR recipe update",
+        recommendation_metrics(chosen),
+    )
+    if official and not development:
+        reason += "; official package is within the 30-day window of the newest maintained stable timestamp"
+    elif timed and not development:
+        stale_official = [
+            record for record in stable
+            if record.get("source") == "repo" and record not in recent
+        ]
+        if stale_official:
+            official_record = stale_official[0]
+            reason += "; official %s Package build date %s is outside the 30-day window" % (
+                variant_record_key(official_record), format_date(actual_timestamp(official_record))
+            )
+    if chosen.get("name", "").endswith("-bin"):
+        reason += (
+            "; -bin usually has faster installation and fewer build dependencies; "
+            "source is locally compiled. Either property by itself does not imply trust"
+        )
+    elif chosen.get("source") == "aur" and not is_vcs_variant(chosen):
+        reason += (
+            "; this source/other variant is locally compiled; -bin usually has faster installation "
+            "and fewer build dependencies. Either property by itself does not imply trust"
+        )
+    reason += ". Age alone is not treated as a safety failure"
+    return {
+        "recommended_key": variant_record_key(chosen),
+        "reason": reason,
+        "comparison_rows": rows,
+    }
+
+
+def comparison_text(result):
+    if not result["comparison_rows"]:
+        return "No comparable variants"
+    lines = [
+        "Variants are compared using metadata; a name suffix alone is not an identity or conflict claim.",
+        "Age alone is not treated as a safety failure.",
+        "-bin usually has faster installation and fewer build dependencies; source is locally compiled. "
+        "Neither property alone implies trust.",
+    ]
+    if result["recommended_key"]:
+        lines.append("Recommended (advisory): " + result["recommended_key"])
+    else:
+        lines.append("Recommendation: none")
+    lines.append("Reason: " + result["reason"])
+    lines.append("Nothing is preselected; installation requires the normal aggregated preview and confirmation.")
+    for row in result["comparison_rows"]:
+        lines.extend(("", row["text"]))
+    return "\n".join(lines)
+
+
+def compare_variants(records, now, target=None):
+    result = recommend_variant(records, now, target=target)
+    result["text"] = comparison_text(result)
+    return result
+
+
+def package_details(record):
+    unavailable = set(record.get("_unavailable", ()))
+    def scalar(key):
+        return "Not available" if key in unavailable else record[key]
+    def listing(key, empty):
+        return "Not available" if key in unavailable else join_or(record[key], empty)
+
+    if record["source"] == "repo":
+        first = "Not tracked by pacman"
+        latest = "Package build date — " + format_date(record["updated"])
+        package_size = format_size(record["download_size"])
+        installed_size = format_size(record["installed_size"])
+        maintainer = "Not available" if "packager" in unavailable else (record["packager"] or "Not available")
+        votes = str(record["votes"]) if record["votes"] is not None else "Not used for official packages"
+        build_requirements = "Not tracked by pacman"
+        check_requirements = "Not tracked by pacman"
+    else:
+        first = "First submitted to AUR — " + format_date(record["first_submitted"])
+        latest = "AUR recipe update — " + format_date(record["updated"])
+        package_size = "Not published by AUR"
+        installed_size = "Unknown until built"
+        maintainer = ("Not available" if "maintainer" in unavailable
+                      else (record["maintainer"] or "Orphaned — no maintainer"))
+        votes = ("Not available" if "votes" in unavailable or record["votes"] is None
+                 else str(record["votes"]))
+        build_requirements = listing("make_depends", "None declared")
+        check_requirements = listing("check_depends", "None declared")
+    if record["source"] == "repo":
+        aur_popularity = "Not used for official packages"
+    else:
+        aur_popularity = ("Not available" if "popularity" in unavailable or record.get("popularity") is None
+                          else str(record["popularity"]))
+    user_share = record.get("user_share")
+    pkgstats = "Not available" if user_share is None else str(user_share)
+    installed_text = "yes" if record.get("installed") else "no"
+    if record.get("installed") and record.get("installed_version"):
+        installed_text += "; version " + record["installed_version"]
+    lines = [
+        "Package: " + record["name"] + " " + scalar("version"),
+        "Description: " + (record.get("description") or "Not available"),
+        "Repository: " + scalar("repository"),
+        "Installed: " + installed_text,
+        "Package base: " + (record.get("package_base") or "Not available"),
+        "Architecture: " + listing("architectures", "Not available"),
+        "Package size: " + package_size,
+        "Installed size: " + installed_size,
+        "Licenses: " + listing("licenses", "Not declared"),
+        "Maintainer / packager: " + maintainer,
+        "First release: " + first,
+        "Latest update: " + latest,
+        "Runtime requirements: " + listing("depends", "None declared"),
+        "Build requirements: " + build_requirements,
+        "Check requirements: " + check_requirements,
+        "Optional requirements: " + listing("optional_depends", "None declared"),
+        "Votes: " + votes,
+        "AUR popularity: " + aur_popularity,
+        "pkgstats popularity: " + pkgstats,
+        "Homepage: " + (record.get("url") or "Not available"),
+        "Category: " + (record.get("category") or (
+            "Not available" if "category" in unavailable else "app"
+        )),
+        "Groups: " + listing("groups", "None declared"),
+        "Keywords: " + listing("keywords", "None declared"),
+        "Provides: " + listing("provides", "None declared"),
+        "Conflicts: " + listing("conflicts", "None declared"),
+        "Out-of-date state: " + out_of_date_text(record),
+    ]
+    if record.get("parent"):
+        lines.append("Requires core: %s (%s)" % (
+            record["parent"], record.get("parent_state") or "Not available"
+        ))
+    addons = record.get("addons") or []
+    if addons:
+        lines.append("Add-ons: %d plugin(s) for it were found, e.g. %s" % (
+            len(addons), ", ".join(addons[:6])
+        ))
+    return "\n".join(lines)
+
+DETAIL_TIMEOUT = 15
+DETAIL_FAILURE_TTL = 300
+DETAIL_BATCH_SIZE = 60
+
+def canonical_package(source, name):
+    if source not in ("repo", "aur") or not name:
+        raise ValueError("invalid package identity")
+    return source + ":" + name
+
+def package_cache_path(cache_root, canonical, failure=False):
+    directory = os.path.join(cache_root, "package-details")
+    if failure:
+        directory = os.path.join(directory, "failures")
+    safe_key = urllib.parse.quote(canonical, safe="")
+    return os.path.join(directory, safe_key + ".json")
+
+def atomic_json(path, value):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".details-", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(value, output, ensure_ascii=False, sort_keys=True)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+def normalized_cached_record(value, source, name):
+    if not isinstance(value, dict) or value.get("source") != source or value.get("name") != name:
+        return None
+    result = new_package(name)
+    for key in PACKAGE_FIELDS:
+        if key in value:
+            result[key] = value[key]
+    if isinstance(value.get("_unavailable"), list):
+        result["_unavailable"] = list(value["_unavailable"])
+    return result
+
+def read_cached_record(path, source, name):
+    try:
+        with open(path, encoding="utf-8") as cached:
+            value = json.load(cached)
+    except (OSError, ValueError):
+        return None
+    return normalized_cached_record(value, source, name)
+
+def read_failure_record(path, source, name):
+    try:
+        with open(path, encoding="utf-8") as cached:
+            value = json.load(cached)
+        failed_at = float(value["failed_at"])
+        if time.time() - failed_at >= DETAIL_FAILURE_TTL:
+            return None
+        return normalized_cached_record(value["record"], source, name)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+def unknown_package(source, name):
+    record = new_package(name)
+    record["source"] = source
+    record["_unavailable"] = [
+        "version", "package_base", "repository", "architectures", "download_size", "installed_size",
+        "licenses", "maintainer", "packager", "updated", "first_submitted",
+        "depends", "make_depends", "check_depends", "optional_depends", "votes",
+        "provides", "conflicts", "parent", "groups", "keywords", "category",
+    ]
+    for field in record["_unavailable"]:
+        record[field] = None
+    return record
+
+def metadata_reason(error):
+    reason = getattr(error, "reason", None)
+    if isinstance(error, (TimeoutError, subprocess.TimeoutExpired)) or isinstance(reason, TimeoutError):
+        return "metadata timed out after %d seconds" % DETAIL_TIMEOUT
+    return "metadata could not be loaded"
+
+def run_pacman_si(names):
+    result = subprocess.run(
+        ["pacman", "-Si", "--"] + list(names),
+        capture_output=True,
+        text=True,
+        env=dict(os.environ, LC_ALL="C"),
+        timeout=DETAIL_TIMEOUT,
+    )
+    if result.returncode != 0 and not result.stdout.strip():
+        raise RuntimeError("pacman metadata unavailable")
+    return result.stdout
+
+def fetch_aur_info(names):
+    query = urllib.parse.urlencode([("arg[]", name) for name in names])
+    request = urllib.request.Request(
+        "https://aur.archlinux.org/rpc/v5/info?" + query,
+        headers={"User-Agent": "arch-smart-update"},
+    )
+    with urllib.request.urlopen(request, timeout=DETAIL_TIMEOUT) as response:
+        payload = json.loads(response.read().decode("utf-8", "replace"))
+    if payload.get("type") == "error":
+        raise RuntimeError("AUR metadata unavailable")
+    return payload.get("results", [])
+
+def fetch_srcinfo(package_base):
+    request = urllib.request.Request(
+        "https://aur.archlinux.org/cgit/aur.git/plain/.SRCINFO?"
+        + urllib.parse.urlencode({"h": package_base}),
+        headers={"User-Agent": "arch-smart-update"},
+    )
+    with urllib.request.urlopen(request, timeout=DETAIL_TIMEOUT) as response:
+        return response.read().decode("utf-8", "replace")
+
+def fetch_details(requests):
+    requested = list(dict.fromkeys(requests))
+    for source, name in requested:
+        canonical_package(source, name)
+    wanted = {source + ":" + name for source, name in requested}
+    records = {}
+
+    repo_names = [name for source, name in requested if source == "repo"]
+    for offset in range(0, len(repo_names), DETAIL_BATCH_SIZE):
+        chunk = repo_names[offset:offset + DETAIL_BATCH_SIZE]
+        try:
+            output = run_pacman_si(chunk)
+            for block in re.split(r"(?:\r?\n){2,}", output.strip()):
+                if not block.strip():
+                    continue
+                try:
+                    record = parse_pacman_si(block)
+                except ValueError:
+                    continue
+                canonical = canonical_package("repo", record["name"])
+                if canonical in wanted:
+                    records[canonical] = record
+        except Exception as error:
+            for name in chunk:
+                record = unknown_package("repo", name)
+                record["_detail_error"] = metadata_reason(error)
+                records["repo:" + name] = record
+
+    aur_names = [name for source, name in requested if source == "aur"]
+    for offset in range(0, len(aur_names), DETAIL_BATCH_SIZE):
+        chunk = aur_names[offset:offset + DETAIL_BATCH_SIZE]
+        try:
+            raw_records = fetch_aur_info(chunk)
+        except Exception as error:
+            for name in chunk:
+                record = unknown_package("aur", name)
+                record["_detail_error"] = metadata_reason(error)
+                records["aur:" + name] = record
+            continue
+        for raw in raw_records:
+            if not isinstance(raw, dict) or not raw.get("Name"):
+                continue
+            canonical = canonical_package("aur", raw["Name"])
+            if canonical not in wanted:
+                continue
+            record = normalize_aur(raw)
+            try:
+                record = parse_srcinfo(fetch_srcinfo(record["package_base"]), record)
+            except Exception as error:
+                record["architectures"] = None
+                record["_unavailable"] = ["architectures"]
+                record["_detail_error"] = metadata_reason(error) + " while reading .SRCINFO"
+            records[canonical] = record
+
+    for source, name in requested:
+        canonical = canonical_package(source, name)
+        if canonical not in records:
+            record = unknown_package(source, name)
+            record["_detail_error"] = "metadata was not returned"
+            records[canonical] = record
+    return records
+
+def write_failure(path, record, reason):
+    try:
+        atomic_json(path, {"failed_at": time.time(), "reason": reason, "record": record})
+    except OSError:
+        pass
+
+def pm_details_records(requests, cache_root):
+    requested = list(dict.fromkeys(requests))
+    for source, name in requested:
+        canonical_package(source, name)
+    records = {}
+    misses = []
+    for source, name in requested:
+        canonical = canonical_package(source, name)
+        cached = read_cached_record(package_cache_path(cache_root, canonical), source, name)
+        if cached is None:
+            cached = read_failure_record(
+                package_cache_path(cache_root, canonical, failure=True), source, name
+            )
+        if cached is None:
+            misses.append((source, name))
+        else:
+            records[canonical] = cached
+
+    fetched = {}
+    if misses:
+        try:
+            fetched = fetch_details(misses)
+        except Exception as error:
+            reason = metadata_reason(error)
+            for source, name in misses:
+                canonical = canonical_package(source, name)
+                record = unknown_package(source, name)
+                write_failure(
+                    package_cache_path(cache_root, canonical, failure=True), record, reason
+                )
+                print("Warning: %s; showing Not available for missing metadata." % reason, file=sys.stderr)
+                records[canonical] = record
+            misses = []
+
+    for source, name in misses:
+        canonical = canonical_package(source, name)
+        success_path = package_cache_path(cache_root, canonical)
+        failure_path = package_cache_path(cache_root, canonical, failure=True)
+        value = fetched.get(canonical)
+        if value is None:
+            reason = "metadata was not returned"
+            record = unknown_package(source, name)
+        else:
+            record = dict(value)
+            reason = record.pop("_detail_error", None)
+            record = normalized_cached_record(record, source, name) or unknown_package(source, name)
+        if reason:
+            write_failure(failure_path, record, reason)
+            print("Warning: %s; showing Not available for missing metadata." % reason, file=sys.stderr)
+        else:
+            try:
+                atomic_json(success_path, record)
+            except OSError:
+                pass
+        records[canonical] = record
+    return records
+
+
+def pm_details_record(source, name, cache_root):
+    canonical = canonical_package(source, name)
+    return pm_details_records([(source, name)], cache_root)[canonical]
+
+def dependency_name(value):
+    return re.split(r"[<>=:]", value.strip(), maxsplit=1)[0].strip()
+
+
+def close_selection(records, selected, installed, core_candidates):
+    result = {"selected": [], "added": [], "notices": [], "unresolved": [],
+              "ambiguous": [], "conflicts": []}
+    pending = list(selected)
+    queued = set(selected)
+    visited = set()
+
+    def append_once(bucket, value):
+        if value not in result[bucket]:
+            result[bucket].append(value)
+
+    while pending:
+        key = pending.pop(0)
+        if key in visited:
+            continue
+        visited.add(key)
+        record = records.get(key)
+        if record is None:
+            append_once("unresolved", key)
+            continue
+        result["selected"].append(key)
+        parent = record.get("parent", "")
+        if not parent or parent in installed:
+            continue
+        if any(records[item]["name"] == parent for item in result["selected"]):
+            continue
+        candidates = core_candidates.get(parent, [])
+        if any(candidate in queued for candidate in candidates):
+            continue
+        if len(candidates) == 1:
+            core = candidates[0]
+            if core not in records:
+                append_once("unresolved", parent)
+                continue
+            append_once("added", core)
+            result["notices"].append("Required core application %s was added" % parent)
+            if core not in queued:
+                pending.append(core)
+                queued.add(core)
+        elif candidates:
+            append_once("ambiguous", {"parent": parent, "candidates": candidates})
+        else:
+            append_once("unresolved", parent)
+
+    selected_keys = result["selected"]
+    for left_index, left_key in enumerate(selected_keys):
+        left = records[left_key]
+        left_conflicts = {dependency_name(item) for item in left.get("conflicts", []) or []}
+        left_identities = {left.get("name", "")} | provided_names(left)
+        for right_key in selected_keys[left_index + 1:]:
+            right = records[right_key]
+            right_conflicts = {dependency_name(item) for item in right.get("conflicts", []) or []}
+            right_identities = {right.get("name", "")} | provided_names(right)
+            if not (left_conflicts & right_identities or right_conflicts & left_identities):
+                continue
+            pair = tuple(sorted((left["name"], right["name"])))
+            append_once("conflicts", pair)
+    return result
+
+
+def build_core_candidates(records, installed):
+    parents = []
+    for record in records.values():
+        parent = record.get("parent") or ""
+        if parent and parent not in parents:
+            parents.append(parent)
+    candidates = {}
+    for parent in parents:
+        matches = []
+        for key, record in records.items():
+            provides = {dependency_name(item) for item in record.get("provides", []) or []}
+            if record.get("name") == parent or parent in provides:
+                matches.append(key)
+        candidates[parent] = matches
+    return candidates
+
+
+def installed_requirements(records, installed):
+    satisfied = set(installed)
+    for record in records.values():
+        if record.get("installed") or record.get("name") in installed:
+            satisfied.add(record["name"])
+            satisfied.update(dependency_name(item) for item in record.get("provides", []) or [])
+    return satisfied
+
+
+def read_search_summaries(search_meta):
+    if not search_meta:
+        return {}
+    path = search_meta + ".jsonl"
+    summaries = {}
+    try:
+        with open(path, encoding="utf-8") as source:
+            for line in source:
+                try:
+                    value = json.loads(line)
+                    source_name = value.get("source")
+                    name = value.get("name")
+                    canonical = canonical_package(source_name, name)
+                    record = normalized_cached_record(value, source_name, name)
+                except (ValueError, TypeError, AttributeError):
+                    continue
+                if record is not None:
+                    summaries[canonical] = record
+    except OSError:
+        pass
+    return summaries
+
+
+def merge_search_jsonl_files(first, second, output_path):
+    records = {}
+    order = []
+    for path in (first, second):
+        try:
+            with open(path, encoding="utf-8") as source:
+                for line in source:
+                    try:
+                        value = json.loads(line)
+                        canonical = canonical_package(value.get("source"), value.get("name"))
+                        record = normalized_cached_record(value, value["source"], value["name"])
+                    except (ValueError, TypeError, AttributeError, KeyError):
+                        continue
+                    if record is None:
+                        continue
+                    if canonical not in records:
+                        order.append(canonical)
+                    records[canonical] = record
+        except OSError:
+            pass
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".search-merge-", dir=os.path.dirname(output_path) or "."
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            for canonical in order:
+                output.write(json.dumps(records[canonical], ensure_ascii=False, sort_keys=True) + "\n")
+        os.replace(temporary, output_path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def merge_summary_record(detail, summary):
+    record = dict(detail)
+    unavailable = set(record.get("_unavailable", ()))
+    summary_unavailable = set(summary.get("_unavailable", ()))
+    empty_fillable = {"package_base", "repository", "version", "description", "installed_version", "url"}
+    for field in PACKAGE_FIELDS:
+        if field in ("name", "source", "installed") or field in summary_unavailable:
+            continue
+        value = summary.get(field)
+        if field in ("category", "parent", "alt"):
+            if value:
+                record[field] = value
+            continue
+        if field == "addons":
+            if value and not record.get(field):
+                record[field] = list(value)
+            continue
+        missing = field in unavailable or record.get(field) is None
+        if record.get(field) == "" and value and field in empty_fillable:
+            missing = True
+        if missing and value is not None:
+            record[field] = copy.deepcopy(value)
+            unavailable.discard(field)
+    if unavailable:
+        record["_unavailable"] = [
+            field for field in record.get("_unavailable", ()) if field in unavailable
+        ]
+    elif "_unavailable" in record:
+        record.pop("_unavailable")
+    return record
+
+
+def apply_parent_states(records, summaries, installed, selected=()):
+    installed = set(installed)
+    selected = set(selected)
+    for record in records.values():
+        parent = record.get("parent")
+        if not parent:
+            continue
+        state = "missing"
+        for key, summary in summaries.items():
+            identities = {summary.get("name", "")} | provided_names(summary)
+            if parent not in identities:
+                continue
+            if summary.get("installed") or summary.get("name") in installed:
+                state = "installed"
+                break
+            if key in selected:
+                state = "selected"
+        if parent in installed:
+            state = "installed"
+        elif state != "installed" and any(key.partition(":")[2] == parent for key in selected):
+            state = "selected"
+        record["parent_state"] = state
+
+
+def merged_details_record(source, name, cache_root, search_meta, installed=(), selected=()):
+    canonical = canonical_package(source, name)
+    summaries = read_search_summaries(search_meta)
+    record = pm_details_record(source, name, cache_root)
+    if canonical in summaries:
+        record = merge_summary_record(record, summaries[canonical])
+    record["installed"] = name in set(installed)
+    records = {canonical: record}
+    apply_parent_states(records, summaries, installed, selected)
+    return record
+
+
+def selection_records(requests, cache_root, search_meta, installed):
+    metadata = {}
+    if search_meta and os.path.isfile(search_meta):
+        with open(search_meta, encoding="utf-8") as source:
+            for line in source:
+                fields = line.rstrip("\n").split("|")
+                if len(fields) >= 3 and fields[0]:
+                    metadata[fields[0]] = (
+                        fields[1], fields[2], fields[8] if len(fields) > 8 else ""
+                    )
+    requested = list(dict.fromkeys(requests))
+    summaries = read_search_summaries(search_meta)
+    loaded = pm_details_records(requested, cache_root)
+    records = {}
+    for source, name in requested:
+        canonical = canonical_package(source, name)
+        record = dict(loaded[canonical])
+        if canonical in summaries:
+            record = merge_summary_record(record, summaries[canonical])
+        elif name in metadata:
+            category, parent, alternate = metadata[name]
+            if category:
+                record["category"] = category
+            if parent:
+                record["parent"] = parent
+            if alternate:
+                record["alt"] = alternate
+        record["installed"] = name in installed
+        records[canonical] = record
+    apply_parent_states(records, summaries, installed)
+    return records
+
+
+def core_dependents(records, selected, installed, core_candidates, core_key):
+    core = records.get(core_key)
+    if core is None:
+        return []
+    provides_unknown = core.get("provides") is None
+    for key in selected:
+        if key == core_key or key not in records:
+            continue
+        parent = records[key].get("parent")
+        if parent is None:
+            raise ValueError("a selected package parent is unknown")
+        if not provides_unknown or not parent or parent in installed or parent == core["name"]:
+            continue
+        known_alternatives = [
+            candidate for candidate in core_candidates.get(parent, [])
+            if candidate != core_key
+        ]
+        if not known_alternatives:
+            raise ValueError("virtual provides for %s are unknown" % parent)
+    selected_set = set(selected)
+    blocked = {core["name"]}
+    blocked.update(dependency_name(item) for item in core.get("provides", []) or [])
+    dependents = []
+    changed = True
+    while changed:
+        changed = False
+        for key in selected:
+            if key == core_key or key in dependents or key not in records:
+                continue
+            record = records[key]
+            parent = record.get("parent") or ""
+            if not parent or parent in installed or parent not in blocked:
+                continue
+            alternatives = [
+                candidate for candidate in core_candidates.get(parent, [])
+                if candidate in selected_set and candidate != core_key and candidate not in dependents
+            ]
+            if alternatives:
+                continue
+            dependents.append(key)
+            blocked.add(record["name"])
+            blocked.update(dependency_name(item) for item in record.get("provides", []) or [])
+            changed = True
+    return dependents
+
+
+def selected_package_identities(search_meta, records_json, selected):
+    summaries = read_search_summaries(search_meta)
+    details = {}
+    try:
+        with open(records_json, encoding="utf-8") as source:
+            loaded = json.load(source)
+        if isinstance(loaded, dict):
+            details = loaded
+    except (OSError, ValueError, TypeError):
+        pass
+    identities = set()
+    for key in selected:
+        record = details.get(key)
+        if key in summaries:
+            record = merge_summary_record(record, summaries[key]) if record else summaries[key]
+        if not record:
+            continue
+        if record.get("name"):
+            identities.add(record["name"])
+        identities.update(provided_names(record))
+    return sorted(identities)
+
+
+def read_name_lines(path):
+    try:
+        with open(path, encoding="utf-8") as source:
+            return [line.rstrip("\n") for line in source if line.rstrip("\n")]
+    except OSError:
+        return []
+
+
+def package_details_cli():
+    if len(sys.argv) in (4, 5) and sys.argv[1] == "--summary-details":
+        summaries = read_search_summaries(sys.argv[2])
+        record = summaries.get(sys.argv[3])
+        if record is None:
+            raise SystemExit(1)
+        if len(sys.argv) == 5 and sys.argv[4]:
+            record["parent_state"] = sys.argv[4]
+        sys.stdout.write(package_details(record) + "\n")
+    elif len(sys.argv) >= 5 and sys.argv[1] == "--details":
+        record = pm_details_record(sys.argv[2], sys.argv[3], sys.argv[4])
+        json.dump(record, sys.stdout, ensure_ascii=False, sort_keys=True)
+        sys.stdout.write("\n")
+    elif len(sys.argv) == 8 and sys.argv[1] == "--merged-details":
+        record = merged_details_record(
+            sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
+            read_name_lines(sys.argv[6]), read_name_lines(sys.argv[7]),
+        )
+        json.dump(record, sys.stdout, ensure_ascii=False, sort_keys=True)
+        sys.stdout.write("\n")
+    elif len(sys.argv) == 5 and sys.argv[1] == "--merge-jsonl":
+        merge_search_jsonl_files(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif len(sys.argv) >= 4 and sys.argv[1] == "--selected-identities":
+        for identity in selected_package_identities(sys.argv[2], sys.argv[3], sys.argv[4:]):
+            sys.stdout.write(identity + "\n")
+    elif len(sys.argv) >= 5 and sys.argv[1] == "--selection-records":
+        requests = []
+        for key in sys.argv[5:]:
+            source, separator, name = key.partition(":")
+            if not separator:
+                raise ValueError("invalid package identity")
+            requests.append((source, name))
+        installed = set(read_name_lines(sys.argv[4]))
+        records = selection_records(requests, sys.argv[2], sys.argv[3], installed)
+        json.dump(records, sys.stdout, ensure_ascii=False, sort_keys=True)
+        sys.stdout.write("\n")
+    elif len(sys.argv) == 4 and sys.argv[1] == "--similar":
+        with open(sys.argv[2], encoding="utf-8") as source:
+            records = json.load(source)
+        target = records[sys.argv[3]]
+        candidates = list(records.values())
+        result = {
+            "rows": similar_packages(target, candidates),
+            "query": similarity_search_query(target, candidates),
+        }
+        json.dump(result, sys.stdout, ensure_ascii=False, sort_keys=True)
+        sys.stdout.write("\n")
+    elif len(sys.argv) == 3 and sys.argv[1] == "--similar-field":
+        result = json.load(sys.stdin)
+        field = sys.argv[2]
+        if field == "keys":
+            for row in result["rows"]:
+                sys.stdout.write(variant_record_key(row) + "\n")
+        elif field == "reasons":
+            for row in result["rows"]:
+                sys.stdout.write(variant_record_key(row) + "\t" + row["reason"] + "\n")
+        elif field == "query":
+            sys.stdout.write(result["query"] + "\n")
+    elif len(sys.argv) >= 6 and sys.argv[1] == "--compare":
+        with open(sys.argv[2], encoding="utf-8") as source:
+            records = json.load(source)
+        for line in read_name_lines(sys.argv[5]):
+            name, separator, version = line.partition(" ")
+            if not separator:
+                continue
+            for record in records.values():
+                if record.get("name") == name:
+                    record["installed"] = True
+                    record["installed_version"] = version
+        keys = sys.argv[6:] or list(records)
+        ordered = [records[key] for key in keys if key in records]
+        candidates = variant_candidates(ordered, sys.argv[3])
+        result = compare_variants(candidates, int(sys.argv[4]), target=sys.argv[3])
+        result["candidate_keys"] = [variant_record_key(record) for record in candidates]
+        json.dump(result, sys.stdout, ensure_ascii=False, sort_keys=True)
+        sys.stdout.write("\n")
+    elif len(sys.argv) == 3 and sys.argv[1] == "--compare-field":
+        result = json.load(sys.stdin)
+        field = sys.argv[2]
+        if field == "keys":
+            for key in result.get("candidate_keys", []):
+                sys.stdout.write(key + "\n")
+        elif field == "replacement_keys":
+            for row in result.get("comparison_rows", []):
+                if row.get("identity_confident"):
+                    sys.stdout.write(row["key"] + "\n")
+        elif field.startswith("row:"):
+            key = field[4:]
+            for row in result.get("comparison_rows", []):
+                if row.get("key") == key:
+                    sys.stdout.write(row.get("text", "") + "\n")
+                    break
+        else:
+            sys.stdout.write(str(result.get(field, "")) + "\n")
+    elif len(sys.argv) == 6 and sys.argv[1] == "--close-selection":
+        with open(sys.argv[2], encoding="utf-8") as source:
+            records = json.load(source)
+        selected = read_name_lines(sys.argv[3])
+        installed = set(read_name_lines(sys.argv[4]))
+        overrides = {}
+        for line in read_name_lines(sys.argv[5]):
+            parent, separator, key = line.partition("|")
+            if separator:
+                overrides[parent] = key
+        installed = installed_requirements(records, installed)
+        candidates = build_core_candidates(records, installed)
+        for parent, key in overrides.items():
+            if parent in candidates and key in candidates[parent]:
+                candidates[parent] = [key]
+        result = close_selection(records, selected, installed, candidates)
+        json.dump(result, sys.stdout, ensure_ascii=False, sort_keys=True)
+        sys.stdout.write("\n")
+    elif len(sys.argv) == 3 and sys.argv[1] == "--closure-field":
+        result = json.load(sys.stdin)
+        field = sys.argv[2]
+        for value in result.get(field, []):
+            if field == "ambiguous":
+                sys.stdout.write(value["parent"] + "|" + ",".join(value["candidates"]) + "\n")
+            elif field == "conflicts":
+                sys.stdout.write("|".join(value) + "\n")
+            else:
+                sys.stdout.write(str(value) + "\n")
+    elif len(sys.argv) == 6 and sys.argv[1] == "--core-dependents":
+        with open(sys.argv[2], encoding="utf-8") as source:
+            records = json.load(source)
+        selected = read_name_lines(sys.argv[3])
+        for key in selected:
+            record = records.get(key)
+            if record is None:
+                raise ValueError("selected package metadata is missing")
+            if "depends" in record.get("_unavailable", []) and not record.get("parent"):
+                raise ValueError("selected package requirements are unknown")
+        installed = installed_requirements(records, set(read_name_lines(sys.argv[4])))
+        candidates = build_core_candidates(records, installed)
+        for key in core_dependents(records, selected, installed, candidates, sys.argv[5]):
+            sys.stdout.write(key + "\n")
+    elif len(sys.argv) == 2 and sys.argv[1] == "--render":
+        sys.stdout.write(package_details(json.load(sys.stdin)) + "\n")
+
+if __name__ == "__main__":
+    package_details_cli()
+PYEOF
 
 # Search results with what people want to know before installing: what it is (app, plugin of which
 # program, library, font/theme, language pack), how popular it is (share of Arch users from
@@ -5823,6 +7881,7 @@ import json, re, subprocess, sys, time, urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 query, repo_file, meta_file = sys.argv[1], sys.argv[2], sys.argv[3]
+jsonl_file = sys.argv[4] if len(sys.argv) > 4 else ""
 UA = {"User-Agent": "arch-smart-update"}
 now = time.time()
 
@@ -5838,6 +7897,9 @@ def base(dep):  # "obs-studio>=28: text" -> obs-studio
 
 pk = {}  # name -> record
 order = []
+repo_summary = {}
+aur_raw = {}
+aur_info_names = set()
 def add(name, **kw):
     if name in pk:
         return
@@ -5846,10 +7908,11 @@ def add(name, **kw):
     rec.update(kw); pk[name] = rec; order.append(name)
 
 # official repositories (pacman -Ss, done by the shell)
-for line in open(repo_file, encoding="utf-8", errors="replace"):
-    p = line.rstrip("\n").split("|", 4)
-    if len(p) == 5:
-        add(p[0], src="repo", repo=p[1], ver=p[2], inst=p[3] == "1", desc=p[4])
+with open(repo_file, encoding="utf-8", errors="replace") as repo_input:
+    for line in repo_input:
+        p = line.rstrip("\n").split("|", 4)
+        if len(p) == 5:
+            add(p[0], src="repo", repo=p[1], ver=p[2], inst=p[3] == "1", desc=p[4])
 
 repo_names = [n for n in order]
 if repo_names:   # build date, URL and dependencies of every repo hit in one pacman call
@@ -5858,6 +7921,15 @@ if repo_names:   # build date, URL and dependencies of every repo hit in one pac
                              env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"}, timeout=30).stdout
     except Exception:
         out = ""
+    for block in re.split(r"(?:\r?\n){2,}", out.strip()):
+        if not block.strip():
+            continue
+        try:
+            parsed = parse_pacman_si(block)
+        except ValueError:
+            continue
+        if parsed["name"] in pk:
+            repo_summary[parsed["name"]] = parsed
     cur, key = None, None
     for line in out.splitlines():
         m = re.match(r"^([A-Za-z][A-Za-z ]+?)\s*: (.*)$", line)
@@ -5877,11 +7949,17 @@ if repo_names:   # build date, URL and dependencies of every repo hit in one pac
                     pass
 
 # AUR: search, then one info call for the dependencies
-installed = set(subprocess.run(["pacman", "-Qq"], capture_output=True, text=True).stdout.split())
+installed_versions = {}
+for installed_line in subprocess.run(["pacman", "-Q"], capture_output=True, text=True).stdout.splitlines():
+    installed_name, separator, installed_version = installed_line.partition(" ")
+    if separator:
+        installed_versions[installed_name] = installed_version
+installed = set(installed_versions)
 repo_all = set(subprocess.run(["pacman", "-Slq"], capture_output=True, text=True).stdout.split())
 aur = get("https://aur.archlinux.org/rpc/v5/search/%s?by=name-desc" % urllib.parse.quote(query)) or {}
 hits = sorted(aur.get("results", []), key=lambda r: -(r.get("Popularity") or 0))[:60]
 for r in hits:
+    aur_raw[r["Name"]] = dict(r)
     add(r["Name"], src="aur", ver=r.get("Version", ""), desc=(r.get("Description") or "").replace("\n", " "),
         inst=r["Name"] in installed, votes=r.get("NumVotes", 0), pop=r.get("Popularity") or 0,
         updated=r.get("LastModified") or 0, ood=bool(r.get("OutOfDate")), url=r.get("URL") or "",
@@ -5892,6 +7970,8 @@ for i in range(0, len(aur_names), 60):
     info = get("https://aur.archlinux.org/rpc/v5/info?" + "&".join("arg[]=" + urllib.parse.quote(n) for n in chunk)) or {}
     for r in info.get("results", []):
         if r["Name"] in pk:
+            aur_raw.setdefault(r["Name"], {}).update(r)
+            aur_info_names.add(r["Name"])
             pk[r["Name"]]["deps"] = [base(d) for d in r.get("Depends", [])]
             pk[r["Name"]]["prov"] = {base(d) for d in r.get("Provides", [])}
             pk[r["Name"]]["conf"] = {base(d) for d in r.get("Conflicts", [])}
@@ -6011,7 +8091,7 @@ def label(r):
     src = r["repo"] if r["src"] == "repo" else "AUR"
     if r["inst"]: src = "✔ installed · " + src
     bits.append(src)
-    if r["cat"] in ("plugin", "lang"): bits.append("🔌 needs " + r["par"])
+    if r["cat"] == "lang": bits.append("🌐 needs " + r["par"])
     if r["alt"]: bits.append("↔ part or variant of " + r["alt"])
     if r["src"] == "aur": bits.append("★ %d votes" % (r["votes"] or 0))
     u = users(r["users"])
@@ -6042,8 +8122,7 @@ groups = {}
 for n in rest:
     if pk[n]["cat"] == "plugin": groups.setdefault(pk[n]["par"], []).append(n)
 for par in sorted(groups, key=lambda p: (-len(groups[p]), p)):
-    st = "✔ installed" if par in installed else "not installed — it comes along as a dependency"
-    emit("@plug-" + par, "🔌 Plugins & add-ons for %s (they need %s to work · %s)" % (par, par, st))
+    emit("@plug-" + par, "🔌 Plugins & add-ons for %s (they need %s to work)" % (par, par))
     for n in groups[par]: emit(pk[n]["src"] + ":" + n, label(pk[n]))
 for cat, title in (("lib", "Libraries & modules (used by other programs; you rarely install these yourself)"),
                    ("look", "Fonts, themes & icons"),
@@ -6055,7 +8134,7 @@ for cat, title in (("lib", "Libraries & modules (used by other programs; you rar
         emit("@" + cat, title)
         for n in ns: emit(pk[n]["src"] + ":" + n, label(pk[n]))
 
-# details for the package screen: name|cat|parent|users|votes|updated|url|plugins-of-it
+# details for the package screen: name|cat|parent|users|votes|updated|url|plugins-of-it|alt
 plugs = {}
 for n in order:
     if pk[n]["cat"] == "plugin": plugs.setdefault(pk[n]["par"], []).append(n)
@@ -6063,7 +8142,58 @@ with open(meta_file, "w", encoding="utf-8") as f:
     for n in order:
         r = pk[n]
         f.write("|".join([n, r["cat"], r["par"], "" if r["users"] is None else str(r["users"]), "" if r["votes"] is None else str(r["votes"]),
-                          str(int(r["updated"] or 0)), r["url"].replace("|", "%7C"), ",".join(plugs.get(n, []))]) + "\n")
+                          str(int(r["updated"] or 0)), r["url"].replace("|", "%7C"), ",".join(plugs.get(n, [])), r["alt"]]) + "\n")
+
+if jsonl_file:
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".search-meta-", dir=os.path.dirname(jsonl_file) or "."
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            for n in order:
+                r = pk[n]
+                unavailable = set()
+                if r["src"] == "repo":
+                    record = copy.deepcopy(repo_summary.get(n) or new_package(n))
+                    record["source"] = "repo"
+                    record["repository"] = r["repo"] or record.get("repository") or ""
+                    record["version"] = r["ver"] or record.get("version") or ""
+                    record["description"] = r["desc"] or record.get("description") or ""
+                    if n not in repo_summary:
+                        for field in (
+                            "updated", "url", "depends", "optional_depends", "architectures",
+                            "licenses", "packager", "download_size", "installed_size",
+                            "provides", "conflicts", "groups", "make_depends", "check_depends",
+                        ):
+                            record[field] = None
+                            unavailable.add(field)
+                else:
+                    record = normalize_aur(aur_raw.get(n) or {"Name": n})
+                    if n not in aur_info_names:
+                        raw = aur_raw.get(n) or {}
+                        for field, raw_field in (
+                            ("depends", "Depends"), ("make_depends", "MakeDepends"),
+                            ("check_depends", "CheckDepends"), ("optional_depends", "OptDepends"),
+                            ("provides", "Provides"), ("conflicts", "Conflicts"),
+                            ("groups", "Groups"), ("keywords", "Keywords"), ("licenses", "License"),
+                        ):
+                            if raw_field not in raw:
+                                record[field] = None
+                                unavailable.add(field)
+                record["installed"] = bool(r["inst"] or n in installed)
+                record["installed_version"] = installed_versions.get(n, "") if record["installed"] else ""
+                record["user_share"] = r["users"]
+                record["category"] = r["cat"]
+                record["parent"] = r["par"]
+                record["alt"] = r["alt"]
+                record["addons"] = list(plugs.get(n, []))
+                if unavailable:
+                    record["_unavailable"] = sorted(unavailable)
+                output.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        os.replace(temporary, jsonl_file)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 PYEOF
 
 pm_search() {  # pm_search QUERY -> R_KEYS / R_LABELS ("repo:name" / "aur:name"), grouped by kind; $TMP/search_meta for details
@@ -6074,15 +8204,48 @@ pm_search() {  # pm_search QUERY -> R_KEYS / R_LABELS ("repo:name" / "aur:name")
         repo = a[1]; name = a[2]; ver = $2; getline d; sub(/^ +/, "", d); gsub(/\|/, "/", d); print name "|" repo "|" ver "|" inst "|" d }' >"$TMP/search_repo"
     while IFS=$'\t' read -r k l; do
         [[ -n $k ]] && { R_KEYS+=("$k"); R_LABELS+=("$l"); }
-    done < <(timeout 60 python3 -I -c "$PM_ENRICH_PY" "$q" "$TMP/search_repo" "$TMP/search_meta" 2>>"$TMP/search_err")
+    done < <(timeout 60 python3 -I -c $'__name__ = "pm_enrich"\n'"$PM_PACKAGE_LIB_PY"$'\n'"$PM_ENRICH_PY" \
+        "$q" "$TMP/search_repo" "$TMP/search_meta" "$TMP/search_meta.jsonl" 2>>"$TMP/search_err")
     (( ${#R_KEYS[@]} )) || pm_search_basic "$q"
     return 0
 }
 
-pm_about() {  # pm_about NAME -> lines for the details screen (from the last search)
-    local n c par users votes upd url plugs line
-    line=$(grep -m1 "^$1|" "$TMP/search_meta" 2>/dev/null) || return 0
-    IFS='|' read -r n c par users votes upd url plugs <<<"$line"
+pm_details_record() {  # pm_details_record SOURCE NAME -> normalized JSON, cached for this runtime search
+    local source=${1:-} name=${2:-}
+    [[ $# -eq 2 && -n $name && ( $source == repo || $source == aur ) && -n ${TMP:-} ]] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 -I -c "$PM_PACKAGE_LIB_PY" --details "$source" "$name" "$TMP"
+}
+
+pm_about() {  # pm_about NAME [SOURCE] -> normalized details, or legacy last-search lines as a basic fallback
+    local name=${1:-} source=${2:-} key n c par users votes upd url plugs alt line record normalized
+    [[ -n $name ]] || return 0
+    if [[ -z $source ]]; then
+        for key in "${R_KEYS[@]}"; do
+            if [[ ${key#*:} == "$name" && ( ${key%%:*} == repo || ${key%%:*} == aur ) ]]; then
+                source=${key%%:*}
+                break
+            fi
+        done
+    fi
+    if [[ -z $source && -r $TMP/search_repo ]]; then
+        while IFS='|' read -r n _; do
+            [[ $n == "$name" ]] && { source=repo; break; }
+        done < "$TMP/search_repo"
+    fi
+    if [[ $source == repo || $source == aur ]] && command -v python3 >/dev/null 2>&1; then
+        pacman -Qq >"$TMP/about-installed" 2>/dev/null || :
+        printf '%s\n' "${!PM_MARKED[@]}" >"$TMP/about-selected"
+        if record=$(python3 -I -c "$PM_PACKAGE_LIB_PY" --merged-details \
+            "$source" "$name" "$TMP" "$TMP/search_meta" "$TMP/about-installed" "$TMP/about-selected"); then
+            if normalized=$(python3 -I -c "$PM_PACKAGE_LIB_PY" --render <<<"$record"); then
+                printf '%s\n' "$normalized"
+                return 0
+            fi
+        fi
+    fi
+    line=$(grep -m1 "^$name|" "$TMP/search_meta" 2>/dev/null) || return 0
+    IFS='|' read -r n c par users votes upd url plugs alt <<<"$line"
     case $c in
         plugin) printf 'Kind:        🔌 plugin / add-on for %s — it only works with %s (%s)\n' "$par" "$par" \
                     "$(pacman -Qq -- "$par" &>/dev/null && echo "installed" || echo "not installed; it is installed with it")" ;;
@@ -6122,13 +8285,14 @@ pm_search_basic() {  # without python3: pacman -Ss + AUR, no categories
     local results
     results=$(aur_json "https://aur.archlinux.org/rpc/v5/search/$(urlencode "$q")?by=name-desc" search 2>/dev/null | sort -t'|' -k4,4gr | head -n 50)
     if [[ -z $results && ( $h == paru || $h == yay ) ]]; then   # no python / RPC: ask the helper
-        results=$("$h" -Ssa -- "$q" 2>/dev/null | strip_ansi | awk '/^aur\// {split($1,a,"/"); n=a[2]; v=$2; getline d; gsub(/^ +/,"",d); gsub(/\|/,"/",d); print n "|" v "|0|0||" d}' | head -n 50)
+        results=$("$h" -Ssa -- "$q" 2>/dev/null | strip_ansi | awk '/^aur\// {split($1,a,"/"); n=a[2]; v=$2; getline d; gsub(/^ +/,"",d); gsub(/\|/,"/",d); print n "|" v "||||" d}' | head -n 50)
     fi
     local votes pop ood
     while IFS='|' read -r name ver votes pop ood desc; do
         [[ -n $name && -z ${seen[$name]:-} ]] || continue
         inst=""; pacman -Qq "$name" &>/dev/null && inst="✔ installed · "
-        tag="🧩 $name $ver  (${inst}AUR · ★$votes${ood:+ · out of date} — $desc)"
+        local vote_label=${votes:-Not available}
+        tag="🧩 $name $ver  (${inst}AUR · ★$vote_label${ood:+ · out of date} — $desc)"
         if [[ $name == "$q" ]]; then exact+=("aur:$name"); exactl+=("$tag")
         else aur_k+=("aur:$name"); aur_l+=("$tag"); fi
     done <<<"$results"
@@ -6164,6 +8328,390 @@ pm_choose_installer() {  # pm_choose_installer repo|aur -> PM_TOOL (pacman, paru
     if [[ $PM_TOOL != "$INSTALL_HELPER" ]]; then INSTALL_HELPER=$PM_TOOL; set_config_value INSTALL_HELPER "$PM_TOOL" >/dev/null 2>&1; fi
 }
 
+pm_selection_records_load() {
+    local key
+    local -a keys=()
+    [[ -n ${TMP:-} ]] || return 1
+    for key in "${R_KEYS[@]}"; do
+        [[ $key == repo:* || $key == aur:* ]] && keys+=("$key")
+    done
+    (( ${#keys[@]} )) || return 1
+    pacman -Qq >"$TMP/selection-installed" 2>/dev/null || :
+    python3 -I -c "$PM_PACKAGE_LIB_PY" --selection-records \
+        "$TMP" "$TMP/search_meta" "$TMP/selection-installed" "${keys[@]}" \
+        >"$TMP/selection-records.json.new" || return 1
+    mv -- "$TMP/selection-records.json.new" "$TMP/selection-records.json"
+}
+
+pm_compare_load() {
+    local key
+    local -a keys=()
+    PM_COMPARE_JSON="" PM_COMPARE_TEXT="" PM_RECOMMENDED_KEY="" PM_COMPARE_KEYS=() PM_REPLACE_KEYS=()
+    [[ -n ${PM_FOCUS:-} ]] || return 1
+    pm_selection_records_load || return 1
+    for key in "${R_KEYS[@]}"; do
+        [[ $key == repo:* || $key == aur:* ]] && keys+=("$key")
+    done
+    (( ${#keys[@]} )) || return 1
+    pacman -Q >"$TMP/selection-installed-versions" 2>/dev/null || :
+    PM_COMPARE_JSON=$(python3 -I -c "$PM_PACKAGE_LIB_PY" --compare \
+        "$TMP/selection-records.json" "$PM_FOCUS" "$(date +%s)" \
+        "$TMP/selection-installed-versions" "${keys[@]}") || return 1
+    PM_COMPARE_TEXT=$(python3 -I -c "$PM_PACKAGE_LIB_PY" --compare-field text <<<"$PM_COMPARE_JSON") || return 1
+    PM_RECOMMENDED_KEY=$(python3 -I -c "$PM_PACKAGE_LIB_PY" --compare-field recommended_key <<<"$PM_COMPARE_JSON") || return 1
+    mapfile -t PM_COMPARE_KEYS < <(python3 -I -c "$PM_PACKAGE_LIB_PY" --compare-field keys <<<"$PM_COMPARE_JSON")
+    mapfile -t PM_REPLACE_KEYS < <(python3 -I -c "$PM_PACKAGE_LIB_PY" --compare-field replacement_keys <<<"$PM_COMPARE_JSON")
+    (( ${#PM_COMPARE_KEYS[@]} ))
+}
+
+pm_use_variant() {
+    local key=$1 item failure=""
+    local valid=false failed=false replace=false
+    local -A saved_marked=() saved_reinstall=() saved_auto=() saved_extras=()
+    local -a saved_order=("${PM_SELECTION_ORDER[@]}")
+    for item in "${PM_COMPARE_KEYS[@]}"; do [[ $item == "$key" ]] && { valid=true; break; }; done
+    [[ $valid == true ]] || return 1
+    for item in "${PM_REPLACE_KEYS[@]}"; do [[ $item == "$key" ]] && { replace=true; break; }; done
+    if [[ -z ${PM_MARKED[$key]:-} ]] && pm_key_installed "$key"; then
+        PM_NOTICE="$key is already installed; choose Reinstall to install it again"
+        ui_dialog "Selection unchanged" "$PM_NOTICE" 0 0 OK
+        return 1
+    fi
+    for item in "${!PM_MARKED[@]}"; do saved_marked[$item]=${PM_MARKED[$item]}; done
+    for item in "${!PM_REINSTALL[@]}"; do saved_reinstall[$item]=${PM_REINSTALL[$item]}; done
+    for item in "${!PM_AUTO_ADDED[@]}"; do saved_auto[$item]=${PM_AUTO_ADDED[$item]}; done
+    for item in "${!PM_EXTRAS[@]}"; do saved_extras[$item]=${PM_EXTRAS[$item]}; done
+    if [[ -z ${PM_MARKED[$key]:-} ]]; then
+        pm_toggle_key "$key" || failed=true
+    fi
+    if [[ $failed == false && $replace == true ]]; then
+        for item in "${PM_REPLACE_KEYS[@]}"; do
+            [[ $item != "$key" && -n ${PM_MARKED[$item]:-} ]] || continue
+            pm_toggle_key "$item" true || { failed=true; break; }
+        done
+    fi
+    if [[ $failed == true ]]; then
+        failure=$PM_NOTICE
+        PM_MARKED=() PM_REINSTALL=() PM_AUTO_ADDED=() PM_EXTRAS=()
+        for item in "${!saved_marked[@]}"; do PM_MARKED[$item]=${saved_marked[$item]}; done
+        for item in "${!saved_reinstall[@]}"; do PM_REINSTALL[$item]=${saved_reinstall[$item]}; done
+        for item in "${!saved_auto[@]}"; do PM_AUTO_ADDED[$item]=${saved_auto[$item]}; done
+        for item in "${!saved_extras[@]}"; do PM_EXTRAS[$item]=${saved_extras[$item]}; done
+        PM_SELECTION_ORDER=("${saved_order[@]}")
+        PM_NOTICE=$failure
+        ui_dialog "Selection unchanged" "$failure" 0 0 OK
+        return 1
+    fi
+    PM_NOTICE="Using $key. Only marks in the explicit target's strong component were eligible for replacement; weak-candidate and unrelated marks were kept. Installation still requires Install marked and confirmation."
+    return 0
+}
+
+pm_compare_menu() {
+    local choice key label row_text
+    local -a opts=()
+    if ! have python3; then
+        ui_dialog "Comparison unavailable" "Enriched variant comparison requires Python. Basic search and installation remain available; no selection was changed." 0 0 OK
+        return 0
+    fi
+    if ! pm_compare_load; then
+        ui_dialog "Comparison unavailable" "Package metadata could not be compared. Your selection has been kept; no packages were changed." 0 0 OK
+        return 0
+    fi
+    for key in "${PM_COMPARE_KEYS[@]}"; do
+        label=${key#*:}
+        [[ $key == "$PM_RECOMMENDED_KEY" ]] && label+=" — Recommended (advisory)"
+        opts+=("$key" "$label")
+    done
+    opts+=(__back "Back")
+    choice=$(ui_choose "Compare package variants" \
+        "$PM_COMPARE_TEXT"$'\n\n'"Choose a variant to review. Its recommendation is only a label; no mark changes until Use this variant." \
+        "${opts[@]}") || return 0
+    [[ $choice == __back || -z $choice ]] && return 0
+    PM_FOCUS=$choice
+    row_text=$(python3 -I -c "$PM_PACKAGE_LIB_PY" --compare-field "row:$choice" <<<"$PM_COMPARE_JSON")
+    ui_dialog "Variant: ${choice#*:}" \
+        "$row_text"$'\n\n'"Recommendation: ${PM_RECOMMENDED_KEY:-none}"$'\n\n'"Only Use this variant changes marks. It does not start installation; unrelated marks are preserved." \
+        1 1 "Use this variant" "Back"
+    (( TUI_CHOICE == 0 )) && pm_use_variant "$choice" || true
+    return 0
+}
+
+pm_similar_load() {  # pm_similar_load KEY -> PM_SIMILAR_KEYS / PM_SIMILAR_LABELS / PM_SIMILAR_REASONS
+    local target=$1 key query line name reason i label
+    local -a reason_lines=()
+    local -A labels=()
+    PM_SIMILAR_KEYS=() PM_SIMILAR_LABELS=() PM_SIMILAR_REASONS=() PM_SIMILAR_JSON=""
+    [[ -n ${TMP:-} && ( $target == repo:* || $target == aur:* ) ]] || return 1
+    pm_selection_records_load || return 1
+    PM_SIMILAR_JSON=$(python3 -I -c "$PM_PACKAGE_LIB_PY" --similar \
+        "$TMP/selection-records.json" "$target") || return 1
+    mapfile -t PM_SIMILAR_KEYS < <(python3 -I -c "$PM_PACKAGE_LIB_PY" --similar-field keys <<<"$PM_SIMILAR_JSON")
+    if (( ${#PM_SIMILAR_KEYS[@]} == 0 )); then
+        query=$(python3 -I -c "$PM_PACKAGE_LIB_PY" --similar-field query <<<"$PM_SIMILAR_JSON")
+        if [[ -n $query ]]; then
+            local -a saved_keys=("${R_KEYS[@]}") saved_labels=("${R_LABELS[@]}") follow_keys=() follow_labels=()
+            local -A known=() meta_seen=()
+            local tag="$$-$RANDOM-$RANDOM"
+            local saved_meta="$TMP/similar-meta-$tag" saved_repo="$TMP/similar-repo-$tag" merged_meta="$TMP/similar-merged-$tag"
+            local saved_jsonl="$TMP/similar-jsonl-$tag" merged_jsonl="$TMP/similar-jsonl-merged-$tag"
+            local had_repo=false
+            if [[ -r $TMP/search_meta ]]; then cp -- "$TMP/search_meta" "$saved_meta"; else : >"$saved_meta"; fi
+            if [[ -r $TMP/search_meta.jsonl ]]; then cp -- "$TMP/search_meta.jsonl" "$saved_jsonl"; else : >"$saved_jsonl"; fi
+            if [[ -r $TMP/search_repo ]]; then cp -- "$TMP/search_repo" "$saved_repo"; had_repo=true; fi
+            log_info "Searching for applications similar to ${target#*:} using '$query'…"
+            pm_search "$query" || true
+            follow_keys=("${R_KEYS[@]}") follow_labels=("${R_LABELS[@]}")
+            R_KEYS=("${saved_keys[@]}") R_LABELS=("${saved_labels[@]}")
+            if [[ $had_repo == true ]]; then mv -- "$saved_repo" "$TMP/search_repo"; else rm -f "$TMP/search_repo"; fi
+            for key in "${R_KEYS[@]}"; do known[$key]=1; done
+            for i in "${!follow_keys[@]}"; do
+                key=${follow_keys[i]}
+                [[ $key == repo:* || $key == aur:* ]] || continue
+                [[ -z ${known[$key]:-} ]] || continue
+                known[$key]=1
+                R_KEYS+=("$key") R_LABELS+=("${follow_labels[i]}")
+            done
+            cp -- "$saved_meta" "$merged_meta"
+            while IFS='|' read -r name _; do
+                [[ -n $name ]] || continue
+                meta_seen[$name]=1
+            done <"$saved_meta"
+            if [[ -r $TMP/search_meta ]]; then
+                while IFS= read -r line; do
+                    name=${line%%|*}
+                    [[ -n $name && -z ${meta_seen[$name]:-} ]] || continue
+                    meta_seen[$name]=1
+                    printf '%s\n' "$line" >>"$merged_meta"
+                done <"$TMP/search_meta"
+            fi
+            mv -- "$merged_meta" "$TMP/search_meta"
+            rm -f "$saved_meta"
+            [[ -r $TMP/search_meta.jsonl ]] || : >"$TMP/search_meta.jsonl"
+            python3 -I -c "$PM_PACKAGE_LIB_PY" --merge-jsonl \
+                "$saved_jsonl" "$TMP/search_meta.jsonl" "$merged_jsonl" || return 1
+            mv -- "$merged_jsonl" "$TMP/search_meta.jsonl"
+            rm -f "$saved_jsonl"
+            pm_selection_records_load || return 1
+            PM_SIMILAR_JSON=$(python3 -I -c "$PM_PACKAGE_LIB_PY" --similar \
+                "$TMP/selection-records.json" "$target") || return 1
+            mapfile -t PM_SIMILAR_KEYS < <(python3 -I -c "$PM_PACKAGE_LIB_PY" --similar-field keys <<<"$PM_SIMILAR_JSON")
+        fi
+    fi
+    (( ${#PM_SIMILAR_KEYS[@]} )) || return 1
+    mapfile -t reason_lines < <(python3 -I -c "$PM_PACKAGE_LIB_PY" --similar-field reasons <<<"$PM_SIMILAR_JSON")
+    for line in "${reason_lines[@]}"; do
+        key=${line%%$'\t'*}; reason=${line#*$'\t'}
+        PM_SIMILAR_REASONS[$key]=$reason
+    done
+    for i in "${!R_KEYS[@]}"; do labels[${R_KEYS[i]}]=${R_LABELS[i]}; done
+    for key in "${PM_SIMILAR_KEYS[@]}"; do
+        label=${labels[$key]:-${key#*:}}
+        PM_SIMILAR_LABELS+=("${key#*:} (${PM_SIMILAR_REASONS[$key]}) · $label")
+    done
+}
+
+pm_package_details() {  # shared Details action; 10 = submit the current marks for installation
+    local key=$1 kind=${1%%:*} name=${1#*:} about
+    about=$(pm_about "$name" "$kind")
+    [[ -n $about ]] || about="No additional metadata is available for $key."
+    ui_dialog "Package details: $name" "$about" 0 1 "Similar apps" Back
+    (( TUI_CHOICE == 0 )) || return 0
+    pm_similar_menu "$key"
+}
+
+pm_similar_menu() {  # scoped suggestion rows over the same selection/result model; 10 = install marked
+    local target=$1 return_focus=$PM_FOCUS key i rc
+    local -a options=() displayed_keys=() displayed_labels=()
+    local -A displayed_reasons=()
+    if ! have python3; then
+        PM_FOCUS=$return_focus
+        ui_dialog "Similar apps unavailable" "Enriched similar-application suggestions require Python. No reliable suggestion is inferred from basic search results." 0 0 OK
+        return 0
+    fi
+    if ! pm_similar_load "$target"; then
+        PM_FOCUS=$return_focus
+        ui_dialog "Similar apps: ${target#*:}" "No reliable similar applications found" 0 0 OK
+        return 0
+    fi
+    displayed_keys=("${PM_SIMILAR_KEYS[@]}") displayed_labels=("${PM_SIMILAR_LABELS[@]}")
+    for key in "${PM_SIMILAR_KEYS[@]}"; do displayed_reasons[$key]=${PM_SIMILAR_REASONS[$key]}; done
+    for i in "${!displayed_keys[@]}"; do options+=("${displayed_keys[i]}" "${displayed_labels[i]}"); done
+    PM_FOCUS=""
+    while :; do
+        ui_multiselect "Similar apps for ${target#*:}" \
+            "Evidence-based alternatives only · Back returns to the prior results · no suggestion is marked automatically" \
+            "${options[@]}"
+        case $PM_ACTION in
+            details)
+                if pm_package_details "$PM_FOCUS"; then rc=0; else rc=$?; fi
+                (( rc == 10 )) && return 10
+                PM_SIMILAR_KEYS=("${displayed_keys[@]}") PM_SIMILAR_LABELS=("${displayed_labels[@]}")
+                PM_SIMILAR_REASONS=()
+                for key in "${displayed_keys[@]}"; do PM_SIMILAR_REASONS[$key]=${displayed_reasons[$key]}; done
+                ;;
+            compare) pm_compare_menu ;;
+            install) return 10 ;;
+            *) PM_FOCUS=$return_focus; return 0 ;;
+        esac
+    done
+}
+
+pm_closure_field() {
+    python3 -I -c "$PM_PACKAGE_LIB_PY" --closure-field "$1" <<<"$PM_CLOSURE_JSON"
+}
+
+pm_build_install_arrays() {
+    local key
+    local -a keys=()
+    PM_INSTALL_REPO=() PM_INSTALL_AUR=()
+    mapfile -t keys < <(printf '%s\n' "${!PM_MARKED[@]}" | sed '/^$/d' | sort)
+    for key in "${keys[@]}"; do
+        case $key in
+            repo:*) PM_INSTALL_REPO+=("${key#*:}") ;;
+            aur:*)  PM_INSTALL_AUR+=("${key#*:}") ;;
+        esac
+    done
+}
+
+pm_install_needs_aur() {
+    local key name
+    local -a extras=()
+    (( ${#PM_INSTALL_AUR[@]} )) && return 0
+    for key in "${!PM_EXTRAS[@]}"; do
+        read -r -a extras <<<"${PM_EXTRAS[$key]:-}"
+        for name in "${extras[@]}"; do
+            [[ ${PM_EXTRA_SOURCE[$key:$name]:-${key%%:*}} == aur ]] && return 0
+        done
+    done
+    return 1
+}
+
+pm_close_marked_selection() {
+    local key parent rc
+    local -a selected=() requested=() closed=() added=() sorted=()
+    PM_NOTICES=() PM_CONFLICTS=() PM_UNRESOLVED=() PM_AMBIGUOUS=()
+    PM_CLOSURE_JSON=""
+    for key in "${PM_SELECTION_ORDER[@]}"; do
+        [[ -n ${PM_MARKED[$key]:-} && -z ${PM_AUTO_ADDED[$key]:-} ]] && requested+=("$key")
+    done
+    mapfile -t sorted < <(printf '%s\n' "${!PM_MARKED[@]}" | sed '/^$/d' | sort)
+    for key in "${sorted[@]}"; do
+        [[ -z ${PM_AUTO_ADDED[$key]:-} ]] || continue
+        [[ " ${requested[*]} " == *" $key "* ]] || requested+=("$key")
+    done
+    for key in "${!PM_AUTO_ADDED[@]}"; do unset 'PM_MARKED[$key]'; done
+    PM_AUTO_ADDED=()
+    (( ${#requested[@]} )) || return 1
+    pm_selection_records_load || return 1
+    printf '%s\n' "${requested[@]}" >"$TMP/selection-selected"
+    : >"$TMP/selection-overrides"
+    for parent in "${!PM_CORE_OVERRIDES[@]}"; do
+        printf '%s|%s\n' "$parent" "${PM_CORE_OVERRIDES[$parent]}" >>"$TMP/selection-overrides"
+    done
+    PM_CLOSURE_JSON=$(python3 -I -c "$PM_PACKAGE_LIB_PY" --close-selection \
+        "$TMP/selection-records.json" "$TMP/selection-selected" "$TMP/selection-installed" \
+        "$TMP/selection-overrides") || return 1
+    mapfile -t closed < <(pm_closure_field selected)
+    mapfile -t added < <(pm_closure_field added)
+    mapfile -t PM_NOTICES < <(pm_closure_field notices)
+    mapfile -t PM_UNRESOLVED < <(pm_closure_field unresolved)
+    mapfile -t PM_AMBIGUOUS < <(pm_closure_field ambiguous)
+    mapfile -t PM_CONFLICTS < <(pm_closure_field conflicts)
+    if (( ${#PM_UNRESOLVED[@]} )); then
+        for parent in "${PM_UNRESOLVED[@]}"; do
+            PM_NOTICES+=("Unresolved required core application: $parent")
+        done
+        return 2
+    fi
+    (( ${#PM_AMBIGUOUS[@]} == 0 )) || return 3
+    PM_MARKED=() PM_SELECTION_ORDER=("${closed[@]}")
+    for key in "${closed[@]}"; do PM_MARKED[$key]=1; done
+    for key in "${added[@]}"; do PM_AUTO_ADDED[$key]=1; done
+    for key in "${!PM_REINSTALL[@]}"; do
+        [[ -n ${PM_MARKED[$key]:-} ]] || unset 'PM_REINSTALL[$key]'
+    done
+    for key in "${!PM_EXTRAS[@]}"; do
+        [[ -n ${PM_MARKED[$key]:-} ]] || unset 'PM_EXTRAS[$key]'
+    done
+    pm_build_install_arrays
+    (( ${#PM_CONFLICTS[@]} == 0 )) || return 4
+    return 0
+}
+
+pm_conflict_menu() {
+    local pair choice key name about body
+    local -a opts=() names=()
+    while :; do
+        body="The selected packages declare Conflicts metadata. Installation is blocked until you explicitly change the selection."$'\n'
+        for pair in "${PM_CONFLICTS[@]}"; do body+=$'\n'"  • ${pair/|/ ↔ }"; done
+        body+=$'\n\n'"Compare the metadata or explicitly unmark a package. Nothing is changed automatically."
+        opts=(compare "Compare the conflicting packages")
+        for key in "${PM_SELECTION_ORDER[@]}"; do
+            opts+=("drop|$key" "Explicitly unmark $key")
+        done
+        choice=$(ui_choose "Resolve package conflicts" "$body" "${opts[@]}") || return 1
+        case $choice in
+            compare)
+                for pair in "${PM_CONFLICTS[@]}"; do
+                    IFS='|' read -ra names <<<"$pair"
+                    for name in "${names[@]}"; do
+                        for key in "${PM_SELECTION_ORDER[@]}"; do
+                            [[ ${key#*:} == "$name" ]] || continue
+                            about=$(pm_about "$name" "${key%%:*}")
+                            ui_dialog "Conflict details: $name" "${about:-No additional metadata is available for $key.}" 0 0 OK
+                            break
+                        done
+                    done
+                done
+                ;;
+            drop\|*)
+                key=${choice#drop|}
+                if pm_toggle_key "$key" true; then return 0; fi
+                ui_dialog "Selection unchanged" "$PM_NOTICE" 0 0 OK
+                ;;
+            *) return 1 ;;
+        esac
+    done
+}
+
+pm_resolve_marked_selection() {
+    local rc entry parent candidates choice
+    local -a opts=() keys=()
+    if ! have python3; then
+        PM_NOTICES=() PM_CONFLICTS=() PM_UNRESOLVED=() PM_AMBIGUOUS=()
+        PM_CLOSURE_JSON=""
+        (( ${#PM_MARKED[@]} )) || return 1
+        pm_build_install_arrays
+        return 0
+    fi
+    while :; do
+        pm_close_marked_selection
+        rc=$?
+        case $rc in
+            0) return 0 ;;
+            2)
+                ui_dialog "Installation blocked" "$(printf '%s\n' "${PM_NOTICES[@]}")"$'\n\n'"The plugin(s) remain selected. No packages were installed." 0 0 OK
+                return 1
+                ;;
+            3)
+                entry=${PM_AMBIGUOUS[0]} parent=${entry%%|*} candidates=${entry#*|}
+                IFS=',' read -ra keys <<<"$candidates"
+                opts=()
+                for choice in "${keys[@]}"; do opts+=("$choice" "Use $choice for $parent"); done
+                choice=$(ui_choose "Choose required core application" "Several providers satisfy $parent. Choose one; cancelling keeps confirmation blocked." "${opts[@]}") || {
+                    ui_dialog "Installation blocked" "No provider was chosen for $parent. Your selection is unchanged; no packages were installed." 0 0 OK
+                    return 1
+                }
+                PM_CORE_OVERRIDES[$parent]=$choice
+                ;;
+            4)
+                pm_conflict_menu || return 1
+                ;;
+            *) return 1 ;;
+        esac
+    done
+}
+
 pm_classify_deps() {  # pm_classify_deps DEP... -> DEP_HAVE / DEP_REPO / DEP_AUR (missing deps resolved one level)
     DEP_HAVE=() DEP_REPO=() DEP_AUR=()
     (( $# )) || return 0
@@ -6183,49 +8731,245 @@ pm_dep_users() {  # "used by N other packages" for an installed dependency
     printf ' · used by %d other package(s)' "$(wc -w <<<"$r")"
 }
 
+pm_sync_provider_rows() {
+    local requirement=$1 db repo
+    local -a databases=("${DB_PATH:-/var/lib/pacman}/sync"/*.db)
+    [[ -e ${databases[0]} ]] || return 1
+    for db in "${databases[@]}"; do
+        [[ -r $db ]] || return 1
+        repo=${db##*/}; repo=${repo%.db}
+        bsdtar -xOf "$db" '*/desc' 2>/dev/null | awk -v requirement="$requirement" -v repository="$repo" '
+            function emit() {
+                if (name != "" && (name == requirement || provides[requirement]))
+                    print name "|" version "|" repository
+            }
+            /^%NAME%$/ {
+                emit(); name=""; version=""; delete provides; field="name"; next
+            }
+            /^%VERSION%$/ { field="version"; next }
+            /^%PROVIDES%$/ { field="provides"; next }
+            /^%/ { field=""; next }
+            {
+                if ($0 == "") next
+                if (field == "name") name=$0
+                else if (field == "version") version=$0
+                else if (field == "provides") {
+                    identity=$0; sub(/[<>=:].*$/, "", identity); provides[identity]=1
+                }
+            }
+            END { emit() }
+        ' || return 1
+    done
+}
+
+pm_add_resolved_extra_row() {
+    local name=$1 owner=$2 role=$3 output info n v r s rc identity base sync_output sync_rc
+    local -a candidate_rows=() candidate_names=() sync_rows=()
+    local -A seen=() sync_seen=()
+    PM_EXTRA_ERROR=""
+    base=$(pkg_name_of "$name")
+    output=$(LC_ALL=C pacman -Sp --print-format '%n|%v|%r|%s' -- "$name" </dev/null 2>/dev/null); rc=$?
+    if (( rc == 0 )); then
+        while IFS='|' read -r n v r s; do
+            [[ -n $n ]] || continue
+            if [[ $n == "$name" || $n == "$base" ]]; then
+                PLAN_ROWS+=("repo|$n|$v|$r|$s|$role|$owner")
+                PM_EXTRA_SOURCE["$owner:$name"]=repo
+                PM_EXTRA_PROVIDER["$owner:$name"]=$n
+                return 0
+            fi
+        done <<<"$output"
+        while IFS='|' read -r n v r s; do
+            [[ -n $n && -z ${seen[$n]:-} ]] || continue
+            seen[$n]=1
+            info=$(LC_ALL=C pacman -Si -- "$n" 2>/dev/null) || continue
+            while read -r identity; do
+                [[ $(pkg_name_of "$identity") == "$base" ]] || continue
+                candidate_rows+=("$n|$v|$r|$s")
+                candidate_names+=("$n")
+                break
+            done < <(awk -F': ' '/^Provides[[:space:]]*:/ && $2 != "None" {print $2}' <<<"$info" | tr ' ' '\n')
+        done <<<"$output"
+    fi
+
+    if (( rc != 0 )); then
+        info=$(LC_ALL=C pacman -Si -- "$name" 2>/dev/null)
+        if awk -F': ' -v expected="$name" \
+            '$1 ~ /^Name[[:space:]]*$/ && $2 == expected { found=1 } END { exit !found }' <<<"$info"; then
+            PLAN_ROWS+=("repo|$name||||$role|$owner")
+            PM_EXTRA_SOURCE["$owner:$name"]=repo
+            PM_EXTRA_PROVIDER["$owner:$name"]=$name
+            return 0
+        fi
+        rc=1
+    fi
+
+    sync_output=$(pm_sync_provider_rows "$base"); sync_rc=$?
+    while IFS='|' read -r n v r; do
+        [[ -n $n && -z ${sync_seen[$n]:-} ]] || continue
+        sync_seen[$n]=1
+        sync_rows+=("$n|$v|$r")
+    done <<<"$sync_output"
+    if (( sync_rc == 0 && ${#sync_rows[@]} == 1 )); then
+        IFS='|' read -r n v r <<<"${sync_rows[0]}"
+        s=""
+        while IFS='|' read -r identity _ _ s; do
+            [[ $identity == "$n" ]] && break
+            s=""
+        done <<<"$output"
+        PLAN_ROWS+=("repo|$n|$v|$r|$s|$role|$owner")
+        PM_EXTRA_SOURCE["$owner:$name"]=repo
+        PM_EXTRA_PROVIDER["$owner:$name"]=$n
+        return 0
+    fi
+    if (( ${#sync_rows[@]} > 1 )); then
+        for n in "${sync_rows[@]}"; do candidate_names+=("${n%%|*}"); done
+        PM_EXTRA_ERROR="Multiple official providers satisfy optional extra $name for $owner: ${candidate_names[*]}. Choose one explicitly; no provider was selected automatically."
+        return 2
+    fi
+    if (( sync_rc == 0 && rc == 0 )); then
+        PM_EXTRA_ERROR="No provider for optional extra $name was independently enumerated in the official sync databases; pacman's implicit default was not accepted."
+        return 2
+    fi
+    if (( sync_rc != 0 && ${#candidate_rows[@]} > 1 )); then
+        PM_EXTRA_ERROR="Multiple official providers satisfy optional extra $name for $owner: ${candidate_names[*]}. Choose one explicitly; no provider was selected automatically."
+        return 2
+    fi
+    if (( sync_rc != 0 && (rc == 0 || ${#candidate_rows[@]} == 1) )); then
+        PM_EXTRA_ERROR="Official providers for optional extra $name could not be independently enumerated; pacman's implicit default was not accepted."
+        return 2
+    fi
+
+    info=$(LC_ALL=C pacman -Si -- "$name" 2>/dev/null); rc=$?
+    if (( rc == 0 )) && awk -F': ' -v expected="$name" \
+        '$1 ~ /^Name[[:space:]]*$/ && $2 == expected { found=1 } END { exit !found }' <<<"$info"; then
+        PLAN_ROWS+=("repo|$name||||$role|$owner")
+        PM_EXTRA_SOURCE["$owner:$name"]=repo
+        PM_EXTRA_PROVIDER["$owner:$name"]=$name
+    else
+        PLAN_ROWS+=("aur|$name|||AUR||$role|$owner")
+        PM_EXTRA_SOURCE["$owner:$name"]=aur
+        PM_EXTRA_PROVIDER["$owner:$name"]=$name
+    fi
+}
+
 pm_install_plan() {  # pm_install_plan repo|aur NAME EXTRAS... -> PLAN_TEXT, PLAN_OPT (optional deps not installed)
-    local kind=$1 name=$2 d l total=0 n v r s
+    local kind=$1 name=$2 d l total=0 n v r s role provider satisfied
     shift 2
     local extras=("$@")
-    PLAN_TEXT="" PLAN_OPT=() PLAN_MAKE=()
+    PLAN_TEXT="" PLAN_OPT=() PLAN_MAKE=() PLAN_ROWS=()
     local -a deps=() optl=()
+    local -A extra_set=()
+    for d in "${extras[@]}"; do extra_set[$d]=1; done
     if [[ $kind == repo ]]; then
-        local info; info=$(LC_ALL=C pacman -Si -- "$name" 2>/dev/null)
+        local info transaction info_rc transaction_rc selected_found=false
+        info=$(LC_ALL=C pacman -Si -- "$name" 2>/dev/null); info_rc=$?
+        if (( info_rc != 0 )) || [[ -z $info ]] || ! grep -q '^Name[[:space:]]*: ' <<<"$info"; then
+            PLAN_TEXT="Could not load official metadata for $name with pacman -Si (exit status $info_rc or an empty/invalid response)."
+            PLAN_ROWS=()
+            return 1
+        fi
         PLAN_TEXT+="$(awk -F': ' '/^Description/ {print $2; exit}' <<<"$info")"$'\n'
         PLAN_TEXT+="Version $(awk -F': ' '/^Version/ {print $2; exit}' <<<"$info") · from [$(awk -F': ' '/^Repository/ {print $2; exit}' <<<"$info")] · signed by the Arch packagers"$'\n'
-        PLAN_TEXT+="$(pm_about "$name")"$'\n\n'
+        PLAN_TEXT+="$(pm_about "$name" "$kind")"$'\n\n'
         PLAN_TEXT+="WILL BE INSTALLED"$'\n'
+        local -a repo_extras=()
+        for d in "${extras[@]}"; do
+            if ! pm_add_resolved_extra_row "$d" "$kind:$name" extra; then
+                PLAN_TEXT="$PM_EXTRA_ERROR Confirmation is blocked."
+                PLAN_ROWS=()
+                return 1
+            fi
+            provider=${PM_EXTRA_PROVIDER[$kind:$name:$d]:-$d}
+            if [[ ${PM_EXTRA_SOURCE[$kind:$name:$d]:-} == repo ]]; then
+                repo_extras+=("$provider")
+                extra_set[$provider]=1
+            fi
+        done
+        transaction=$(LC_ALL=C pacman -Sp --print-format '%n|%v|%r|%s' -- "$name" "${repo_extras[@]}" </dev/null 2>/dev/null); transaction_rc=$?
+        if (( transaction_rc != 0 )); then
+            PLAN_TEXT="Could not resolve the official installation transaction for $name with pacman -Sp (exit status $transaction_rc)."
+            PLAN_ROWS=()
+            return 1
+        fi
         while IFS='|' read -r n v r s; do
             [[ -n $n ]] || continue
             (( total += s ))
+            role=dependency
+            if [[ $n == "$name" ]]; then role=selected; selected_found=true
+            elif [[ -n ${extra_set[$n]:-} ]]; then
+                PLAN_TEXT+="  + $n $v   (optional extra you chose, from [$r])"$'\n'
+                continue
+            fi
+            PLAN_ROWS+=("repo|$n|$v|$r|$s|$role|$kind:$name")
             if [[ $n == "$name" ]]; then PLAN_TEXT+="  + $n $v   (the package you chose, $(human "$s") download)"$'\n'
             else PLAN_TEXT+="  + $n $v   (needed by it, from [$r])"$'\n'; fi
-        done < <(LC_ALL=C pacman -Sp --print-format '%n|%v|%r|%s' -- "$name" "${extras[@]}" </dev/null 2>/dev/null)
+        done <<<"$transaction"
+        if [[ $selected_found != true ]]; then
+            PLAN_TEXT="Official transaction metadata for $name did not include the selected package. Confirmation is blocked."
+            PLAN_ROWS=()
+            return 1
+        fi
         PLAN_TEXT+="  Download: $(human "$total")"$'\n'
         read -ra deps <<<"$(awk -F': ' '/^Depends On/ {print $2; exit}' <<<"$info" | sed 's/None//')"
         mapfile -t optl < <(awk '/^Optional Deps/ {f=1; sub(/^[^:]+: */, ""); print; next} f && /^ / {sub(/^ +/, ""); print; next} f {exit}' <<<"$info" | grep -v '^None$')
     else
+        if ! have python3; then
+            PLAN_TEXT+="Basic AUR preview for $name. Enriched metadata is unavailable without Python."$'\n'
+            PLAN_TEXT+="Version: Not available · AUR votes: Not available · AUR popularity: Not available"$'\n'
+            PLAN_TEXT+="AUR recipe update: Not available · Homepage: Not available"$'\n'
+            PLAN_TEXT+="Dependencies, optional dependencies, and build requirements are resolved by $PM_TOOL; review its output and prompts."$'\n\n'
+            PLAN_TEXT+="WILL BE INSTALLED"$'\n'"  + $name   (built from the AUR; download size Not available)"$'\n'
+            PLAN_ROWS+=("aur|$name||AUR||selected|$kind:$name")
+            for d in "${extras[@]}"; do
+                pm_add_resolved_extra_row "$d" "$kind:$name" extra
+                PLAN_TEXT+="  + $d   (optional extra you chose)"$'\n'
+            done
+            return 0
+        fi
         local -A ai=(); local k
         while IFS='=' read -r k v; do [[ -n $k ]] && ai[$k]=$v; done < <(aur_json "https://aur.archlinux.org/rpc/v5/info?arg%5B%5D=$(urlencode "$name")" info)
         if [[ -z ${ai[Name]:-} ]]; then PLAN_TEXT="Could not load the AUR details of $name (no answer from aur.archlinux.org, or python3 is missing)."; return 1; fi
         PLAN_TEXT+="${ai[Description]}"$'\n'
-        PLAN_TEXT+="Version ${ai[Version]} · AUR · maintainer: ${ai[Maintainer]:-none (orphaned)} · ★${ai[NumVotes]} · updated $(date -d "@${ai[LastModified]:-0}" +%F 2>/dev/null)"$'\n'
+        local aur_updated=${ai[LastModified]:-} aur_update_text="Not available"
+        if [[ $aur_updated =~ ^[0-9]+$ ]] && (( aur_updated > 0 )); then
+            aur_update_text=$(date -d "@$aur_updated" +%F 2>/dev/null) || aur_update_text="Not available"
+            [[ -n $aur_update_text ]] || aur_update_text="Not available"
+        fi
+        PLAN_TEXT+="Version ${ai[Version]} · AUR · maintainer: ${ai[Maintainer]:-none (orphaned)} · ★${ai[NumVotes]} · updated $aur_update_text"$'\n'
         [[ -n ${ai[OutOfDate]} ]] && PLAN_TEXT+="⚠ Flagged out of date since $(date -d "@${ai[OutOfDate]}" +%F 2>/dev/null)"$'\n'
         [[ -z ${ai[Maintainer]} ]] && PLAN_TEXT+="⚠ Orphaned: nobody maintains this package"$'\n'
-        PLAN_TEXT+="$(pm_about "$name")"$'\n'
+        PLAN_TEXT+="$(pm_about "$name" "$kind")"$'\n'
         PLAN_TEXT+="AUR packages are built on your computer from a script anyone can upload: read the PKGBUILD when the helper shows it."$'\n\n'
         IFS=$'\t' read -ra deps <<<"${ai[Depends]}"
         IFS=$'\t' read -ra optl <<<"${ai[OptDepends]}"
         local -a mk=(); IFS=$'\t' read -ra mk <<<"${ai[MakeDepends]}${ai[CheckDepends]:+$'\t'${ai[CheckDepends]}}"
         PLAN_TEXT+="WILL BE INSTALLED"$'\n'"  + $name ${ai[Version]}   (built from the AUR)"$'\n'
+        PLAN_ROWS+=("aur|$name|${ai[Version]}|AUR||selected|$kind:$name")
         pm_classify_deps "${deps[@]}"
         local have_deps=("${DEP_HAVE[@]}")
-        for d in "${DEP_REPO[@]}"; do PLAN_TEXT+="  + $d   (needed by it, from the official repos)"$'\n'; done
-        for d in "${DEP_AUR[@]}"; do PLAN_TEXT+="  + $d   (needed by it, also built from the AUR — plus its own dependencies)"$'\n'; done
-        for d in "${extras[@]}"; do PLAN_TEXT+="  + $d   (optional extra you chose)"$'\n'; done
+        for d in "${DEP_REPO[@]}"; do
+            PLAN_ROWS+=("repo|$d||||dependency|$kind:$name")
+            PLAN_TEXT+="  + $d   (needed by it, from the official repos)"$'\n'
+        done
+        for d in "${DEP_AUR[@]}"; do
+            PLAN_ROWS+=("aur|$d|||AUR||dependency|$kind:$name")
+            PLAN_TEXT+="  + $d   (needed by it, also built from the AUR — plus its own dependencies)"$'\n'
+        done
+        for d in "${extras[@]}"; do
+            if ! pm_add_resolved_extra_row "$d" "$kind:$name" extra; then
+                PLAN_TEXT="$PM_EXTRA_ERROR Confirmation is blocked."
+                PLAN_ROWS=()
+                return 1
+            fi
+            provider=${PM_EXTRA_PROVIDER[$kind:$name:$d]:-$d}
+            PLAN_TEXT+="  + $d   (optional extra you chose${provider:+; provider $provider})"$'\n'
+        done
         if (( ${#mk[@]} )); then
             pm_classify_deps "${mk[@]}"
             PLAN_MAKE=("${DEP_REPO[@]}" "${DEP_AUR[@]}")
+            for d in "${DEP_REPO[@]}"; do PLAN_ROWS+=("repo|$d||||build|$kind:$name"); done
+            for d in "${DEP_AUR[@]}"; do PLAN_ROWS+=("aur|$d|||AUR||build|$kind:$name"); done
             if (( ${#PLAN_MAKE[@]} )); then
                 PLAN_TEXT+=$'\n'"ONLY NEEDED TO BUILD IT (can be removed right after)"$'\n'
                 for d in "${PLAN_MAKE[@]}"; do PLAN_TEXT+="  ~ $d"$'\n'; done
@@ -6237,7 +8981,10 @@ pm_install_plan() {  # pm_install_plan repo|aur NAME EXTRAS... -> PLAN_TEXT, PLA
     if [[ $kind == repo ]]; then pm_classify_deps "${deps[@]}"; fi
     if (( ${#DEP_HAVE[@]} )); then
         PLAN_TEXT+=$'\n'"ALREADY ON YOUR SYSTEM (it uses them — keep them installed)"$'\n'
-        for d in "${DEP_HAVE[@]}"; do PLAN_TEXT+="  ✓ $d$(pm_dep_users "$d")"$'\n'; done
+        for d in "${DEP_HAVE[@]}"; do
+            PLAN_ROWS+=("installed|$d||||installed|$kind:$name")
+            PLAN_TEXT+="  ✓ $d$(pm_dep_users "$d")"$'\n'
+        done
     fi
     # optional extras
     if (( ${#optl[@]} )); then
@@ -6245,7 +8992,18 @@ pm_install_plan() {  # pm_install_plan repo|aur NAME EXTRAS... -> PLAN_TEXT, PLA
         for l in "${optl[@]}"; do
             [[ -n $l ]] || continue
             d=$(pkg_name_of "$l")
-            if pacman -Qq -- "$d" &>/dev/null; then PLAN_TEXT+="  ✓ $l   (already installed)"$'\n'
+            if ! pm_add_resolved_extra_row "$d" "$kind:$name" optional; then
+                PLAN_TEXT+="  ○ $l   ($PM_EXTRA_ERROR)"$'\n'
+                PLAN_OPT+=("$d|${l#*: }")
+                continue
+            fi
+            provider=${PM_EXTRA_PROVIDER[$kind:$name:$d]:-$d}
+            if [[ $provider != "$d" ]]; then
+                pacman -T -- "$d" &>/dev/null && satisfied=true || satisfied=false
+            else
+                pacman -Qq -- "$provider" &>/dev/null && satisfied=true || satisfied=false
+            fi
+            if [[ $satisfied == true ]]; then PLAN_TEXT+="  ✓ $l   (already installed${provider:+; provider $provider})"$'\n'
             else PLAN_TEXT+="  ○ $l"$'\n'; PLAN_OPT+=("$d|${l#*: }"); fi
         done
     fi
@@ -6268,7 +9026,304 @@ pm_pick_extras() {  # toggle optional dependencies -> PICKED (array)
         [[ $choice == done ]] && break
         if [[ ${on[$choice]:-} ]]; then unset "on[$choice]"; else on[$choice]=1; fi
     done
-    PICKED=("${!on[@]}")
+    mapfile -t PICKED < <(printf '%s\n' "${!on[@]}" | sed '/^$/d' | sort)
+}
+
+pm_install_plan_many() {
+    local key kind name package_text summary row src n v repo size role owner canonical aggregate rank
+    local total=0
+    local -a keys=() sorted=() extras=() all_rows=() unknown=() canonical_order=()
+    local -A selected_set=() row_seen=() known_size=() make_seen=() canonical_seen=()
+    local -A role_rank=() row_role=() row_owner=() row_version=()
+    PLAN_TEXT="" PM_PLAN_OPTIONS=() PM_PLAN_MAKE=() PM_EXTRA_SOURCE=() PM_EXTRA_PROVIDER=()
+    if (( ${#PM_UNRESOLVED[@]} || ${#PM_AMBIGUOUS[@]} || ${#PM_CONFLICTS[@]} )); then
+        PLAN_TEXT="Installation confirmation is blocked until the selection problems are resolved."
+        for key in "${PM_UNRESOLVED[@]}"; do PLAN_TEXT+=$'\n'"Unresolved required core application: $key"; done
+        for key in "${PM_AMBIGUOUS[@]}"; do PLAN_TEXT+=$'\n'"Ambiguous required core application: ${key%%|*}"; done
+        for key in "${PM_CONFLICTS[@]}"; do PLAN_TEXT+=$'\n'"Conflict: ${key/|/ ↔ }"; done
+        return 1
+    fi
+    pm_build_install_arrays
+    keys=("${PM_SELECTION_ORDER[@]}")
+    mapfile -t sorted < <(printf '%s\n' "${!PM_MARKED[@]}" | sed '/^$/d' | sort)
+    for key in "${sorted[@]}"; do
+        [[ " ${keys[*]} " == *" $key "* ]] || keys+=("$key")
+    done
+    (( ${#keys[@]} )) || { PLAN_TEXT="No packages are selected."; return 1; }
+    for key in "${keys[@]}"; do selected_set[$key]=1; done
+    PLAN_TEXT="Selected applications:"
+    for key in "${keys[@]}"; do
+        [[ -n ${PM_AUTO_ADDED[$key]:-} ]] && continue
+        PLAN_TEXT+=$'\n'"  • $key${PM_REINSTALL[$key]:+ (explicit reinstall)}"
+    done
+    if (( ${#PM_AUTO_ADDED[@]} )); then
+        PLAN_TEXT+=$'\n\n'"Auto-added core applications:"
+        for key in "${keys[@]}"; do
+            [[ -n ${PM_AUTO_ADDED[$key]:-} ]] && PLAN_TEXT+=$'\n'"  • $key (required core)"
+        done
+    fi
+    if (( ${#PM_NOTICES[@]} )); then
+        PLAN_TEXT+=$'\n\n'"Selection notices:"
+        for key in "${PM_NOTICES[@]}"; do PLAN_TEXT+=$'\n'"  • $key"; done
+    fi
+    local failed=false
+    for key in "${keys[@]}"; do
+        kind=${key%%:*} name=${key#*:}
+        read -r -a extras <<<"${PM_EXTRAS[$key]:-}"
+        aggregate=$PLAN_TEXT
+        PLAN_ROWS=() PLAN_OPT=() PLAN_MAKE=()
+        if ! pm_install_plan "$kind" "$name" "${extras[@]}"; then
+            package_text=$PLAN_TEXT
+            PLAN_TEXT=$aggregate
+            failed=true
+            PLAN_TEXT+=$'\n\n'"PACKAGE $key"$'\n'"$package_text"
+            PLAN_TEXT+=$'\n'"Metadata could not be loaded for $key; confirmation is blocked."
+            continue
+        fi
+        package_text=$PLAN_TEXT
+        PLAN_TEXT=$aggregate
+        summary=$package_text
+        [[ $summary == *$'\nWILL BE INSTALLED'* ]] && summary=${summary%%$'\nWILL BE INSTALLED'*}
+        PLAN_TEXT+=$'\n\n'"PACKAGE $key"$'\n'"$summary"
+        if (( ${#PLAN_OPT[@]} )); then PM_PLAN_OPTIONS[$key]=$(printf '%s\n' "${PLAN_OPT[@]}"); fi
+        all_rows+=("${PLAN_ROWS[@]}")
+    done
+    PLAN_TEXT+=$'\n\n'"WILL BE INSTALLED — deduplicated dependency preview"
+    local build_text="" installed_text="" optional_text=""
+    for row in "${all_rows[@]}"; do
+        IFS='|' read -r src n v repo size role owner <<<"$row"
+        [[ $size =~ ^[0-9]+$ ]] || continue
+        case $role in selected|dependency|extra|build) ;; *) continue ;; esac
+        if [[ $src == repo || $src == aur ]]; then
+            canonical=$src:$n
+            [[ -n ${known_size[$canonical]:-} ]] || known_size[$canonical]=$size
+        fi
+    done
+    for row in "${all_rows[@]}"; do
+        IFS='|' read -r src n v repo size role owner <<<"$row"
+        [[ $src == repo || $src == aur ]] || continue
+        case $role in
+            selected) rank=0 ;;
+            extra) rank=1 ;;
+            dependency) rank=2 ;;
+            build) rank=3 ;;
+            *) continue ;;
+        esac
+        canonical=$src:$n
+        if [[ -z ${canonical_seen[$canonical]:-} ]]; then
+            canonical_seen[$canonical]=1 canonical_order+=("$canonical") role_rank[$canonical]=99
+        fi
+        if (( rank < ${role_rank[$canonical]} )); then
+            role_rank[$canonical]=$rank row_role[$canonical]=$role
+            row_owner[$canonical]=$owner row_version[$canonical]=$v
+        fi
+    done
+    for canonical in "${canonical_order[@]}"; do
+        role=${row_role[$canonical]} v=${row_version[$canonical]} owner=${row_owner[$canonical]}
+        n=${canonical#*:}
+        if [[ -n ${known_size[$canonical]:-} ]]; then (( total += ${known_size[$canonical]} ))
+        else unknown+=("$canonical"); fi
+        [[ $role == selected || -n ${selected_set[$canonical]:-} ]] && continue
+        case $role in
+            build)
+                [[ -n ${make_seen[$n]:-} ]] || { PM_PLAN_MAKE+=("$n"); make_seen[$n]=1; }
+                build_text+=$'\n'"  ~ $canonical (for $owner; not a requested application)"
+                ;;
+            *) PLAN_TEXT+=$'\n'"  + $canonical${v:+ $v} (${role}; for $owner)" ;;
+        esac
+    done
+    for row in "${all_rows[@]}"; do
+        IFS='|' read -r src n v repo size role owner <<<"$row"
+        [[ -n $n ]] || continue
+        if [[ $src == repo || $src == aur ]]; then canonical=$src:$n; else canonical=installed:$n; fi
+        case $role in
+            installed)
+                [[ -n ${row_seen[$role:$canonical]:-} ]] && continue
+                row_seen[$role:$canonical]=1
+                installed_text+=$'\n'"  ✓ $n (required by $owner)"
+                ;;
+            optional)
+                [[ -n ${row_seen[$role:$canonical:$owner]:-} ]] && continue
+                row_seen[$role:$canonical:$owner]=1
+                optional_text+=$'\n'"  ○ $canonical (for $owner)"
+                ;;
+        esac
+    done
+    if [[ -n $build_text ]]; then
+        PLAN_TEXT+=$'\n\n'"ONLY NEEDED TO BUILD (not selected applications):$build_text"
+    fi
+    if [[ -n $installed_text ]]; then
+        PLAN_TEXT+=$'\n\n'"ALREADY ON YOUR SYSTEM (keep these dependencies):$installed_text"
+    fi
+    if [[ -n $optional_text ]]; then
+        PLAN_TEXT+=$'\n\n'"OPTIONAL — NOT NEEDED (per owning package):$optional_text"
+    fi
+    PLAN_TEXT+=$'\n\n'"Known download total: $(human "$total")"
+    (( ${#unknown[@]} )) && PLAN_TEXT+=$'\n'"Unknown size for: ${unknown[*]}"
+    if [[ $failed == true ]]; then
+        PLAN_TEXT+=$'\n\n'"One or more package plans failed. No installation can be confirmed."
+        return 1
+    fi
+    return 0
+}
+
+pm_pick_extras_for() {
+    local key=$1 entry
+    [[ -n ${PM_PLAN_OPTIONS[$key]:-} ]] || return 1
+    PLAN_OPT=()
+    while IFS= read -r entry; do [[ -n $entry ]] && PLAN_OPT+=("$entry"); done <<<"${PM_PLAN_OPTIONS[$key]}"
+    read -r -a PICKED <<<"${PM_EXTRAS[$key]:-}"
+    pm_pick_extras
+    PM_EXTRAS[$key]="${PICKED[*]}"
+}
+
+pm_pick_extras_many() {
+    local key choice
+    local -a owners=() opts=()
+    for key in "${PM_SELECTION_ORDER[@]}"; do
+        [[ -n ${PM_PLAN_OPTIONS[$key]:-} ]] && owners+=("$key")
+    done
+    (( ${#owners[@]} )) || return 1
+    if (( ${#owners[@]} == 1 )); then pm_pick_extras_for "${owners[0]}"; return; fi
+    for key in "${owners[@]}"; do opts+=("$key" "Choose extras for $key"); done
+    choice=$(ui_choose "Optional extras — choose package" "Extras are kept separately for each owning package." "${opts[@]}") || return 1
+    pm_pick_extras_for "$choice"
+}
+
+pm_run_install_command() {
+    local log=$1 domain=$2 rc tries=0
+    shift 2
+    while :; do
+        pm_run_logged "$log" "$@"; rc=$?
+        (( rc == 0 )) && return 0
+        log_error "Package command failed with exit code $rc (log: $log)"
+        (( tries++ )) && return "$rc"
+        diagnose "$log" "$domain"; report_diagnosis
+        ui_ask "Apply the fixes above and try again?" y || return "$rc"
+        apply_fixes || return "$rc"
+    done
+}
+
+pm_execute_install_plan() {
+    local key name kind extra_kind provider satisfied rc repo_failed=false command_failed=false removemake=false
+    local repo_reinstall=false aur_reinstall=false virtual_verified=false
+    local -a keys=() repo_cmd=() aur_cmd=() repo_extras=() aur_extras=() extras=()
+    PM_VERIFY_STATUS=() PM_VERIFY_MISSING=() PM_INSTALL_LOGS=() PM_INSTALL_SUCCESS=false PM_INSTALL_ERROR=""
+    mapfile -t keys < <(printf '%s\n' "${!PM_MARKED[@]}" | sed '/^$/d' | sort)
+    for key in "${keys[@]}"; do
+        [[ -n ${PM_REINSTALL[$key]:-} ]] || continue
+        [[ $key == repo:* ]] && repo_reinstall=true
+        [[ $key == aur:* ]] && aur_reinstall=true
+    done
+    for key in "${keys[@]}"; do
+        read -r -a extras <<<"${PM_EXTRAS[$key]:-}"
+        for name in "${extras[@]}"; do
+            extra_kind=${PM_EXTRA_SOURCE[$key:$name]:-${key%%:*}}
+            provider=${PM_EXTRA_PROVIDER[$key:$name]:-$name}
+            case $extra_kind in
+                repo) repo_extras+=("$provider") ;;
+                aur) aur_extras+=("$provider") ;;
+            esac
+        done
+    done
+    if (( ${#PM_INSTALL_AUR[@]} || ${#aur_extras[@]} )) && [[ -z ${PM_TOOL:-} || $PM_TOOL == pacman ]]; then
+        PM_INSTALL_ERROR="AUR packages require a real AUR helper; pacman cannot be used for the AUR command. No package commands were run."
+        UNRESOLVED+=("$PM_INSTALL_ERROR")
+        log_error "$PM_INSTALL_ERROR"
+        ui_dialog "Installation blocked" "$PM_INSTALL_ERROR" 0 0 OK
+        return 1
+    fi
+    if (( ${#PM_INSTALL_AUR[@]} || ${#aur_extras[@]} )) && (( ${#PM_PLAN_MAKE[@]} )) && [[ $PM_TOOL == paru || $PM_TOOL == yay ]]; then
+        ui_ask "Remove the build-only packages (${PM_PLAN_MAKE[*]}) after they are built? They are not needed to run the applications." y && removemake=true
+    fi
+    (( ${#PM_INSTALL_REPO[@]} || ${#PM_INSTALL_AUR[@]} || ${#repo_extras[@]} || ${#aur_extras[@]} )) || return 1
+    ensure_sudo || return 1
+    session_set task "Installing ${#PM_MARKED[@]} marked packages"
+    if (( ${#PM_INSTALL_REPO[@]} || ${#repo_extras[@]} )); then
+        repo_cmd=(sudo pacman -S)
+        [[ $repo_reinstall == true ]] || repo_cmd+=(--needed)
+        repo_cmd+=(-- "${PM_INSTALL_REPO[@]}" "${repo_extras[@]}")
+        local repo_log="$TMP/install-repo.log"
+        PM_INSTALL_LOGS+=("$repo_log")
+        log_step "Installing official packages: ${PM_INSTALL_REPO[*]}"
+        pm_run_install_command "$repo_log" pacman "${repo_cmd[@]}" || { repo_failed=true; command_failed=true; }
+    fi
+    if (( ${#PM_INSTALL_AUR[@]} || ${#aur_extras[@]} )); then
+        local aur_log="$TMP/install-aur.log"
+        if [[ $repo_failed == true ]]; then
+            log_error "AUR installation was skipped because the official package command failed; see $repo_log"
+        else
+            case $PM_TOOL in
+                pamac) aur_cmd=(pamac build "${PM_INSTALL_AUR[@]}" "${aur_extras[@]}") ;;
+                *)
+                    aur_cmd=("$PM_TOOL" -S)
+                    [[ $aur_reinstall == true ]] || aur_cmd+=(--needed)
+                    [[ $removemake == true ]] && aur_cmd+=(--removemake)
+                    aur_cmd+=(-- "${PM_INSTALL_AUR[@]}" "${aur_extras[@]}")
+                    ;;
+            esac
+            PM_INSTALL_LOGS+=("$aur_log")
+            log_step "Installing AUR packages with $PM_TOOL: ${PM_INSTALL_AUR[*]}"
+            pm_run_install_command "$aur_log" aur "${aur_cmd[@]}" || command_failed=true
+        fi
+    fi
+    local results="" verified_name
+    local -A verified=()
+    for key in "${keys[@]}"; do
+        name=${key#*:}
+        if pacman -Qq -- "$name" &>/dev/null; then
+            PM_VERIFY_STATUS[$key]=installed
+            results+=$'\n'"  ✓ $key — installed"
+            log_success "$key is installed"
+        else
+            PM_VERIFY_STATUS[$key]=missing PM_VERIFY_MISSING+=("$name")
+            results+=$'\n'"  ✗ $key — MISSING"
+            log_error "$key was requested but is not installed"
+            UNRESOLVED+=("Requested package $key is missing after installation")
+        fi
+        verified[$name]=1
+    done
+    for key in "${keys[@]}"; do
+        read -r -a extras <<<"${PM_EXTRAS[$key]:-}"
+        for name in "${extras[@]}"; do
+            [[ -n ${verified[$key:$name]:-} ]] && continue
+            kind=${PM_EXTRA_SOURCE[$key:$name]:-${key%%:*}}
+            provider=${PM_EXTRA_PROVIDER[$key:$name]:-$name}
+            verified[$key:$name]=1 verified_name=$kind:$name
+            if [[ $provider != "$name" ]]; then
+                virtual_verified=true
+                pacman -T -- "$name" &>/dev/null && satisfied=true || satisfied=false
+            else
+                pacman -Qq -- "$provider" &>/dev/null && satisfied=true || satisfied=false
+            fi
+            if [[ $satisfied == true ]]; then
+                PM_VERIFY_STATUS[$verified_name]=installed
+                results+=$'\n'"  ✓ $verified_name (extra${provider:+; provider $provider}) — installed"
+            else
+                PM_VERIFY_STATUS[$verified_name]=missing PM_VERIFY_MISSING+=("$name")
+                results+=$'\n'"  ✗ $verified_name (extra; provider $provider) — MISSING"
+                UNRESOLVED+=("Requested optional extra $verified_name (provider $provider) is missing after installation")
+            fi
+        done
+    done
+    if (( ${#PM_VERIFY_MISSING[@]} == 0 )) && [[ $command_failed == false ]]; then PM_INSTALL_SUCCESS=true; fi
+    if (( ${#PM_INSTALL_LOGS[@]} )); then results+=$'\n\n'"Logs: ${PM_INSTALL_LOGS[*]}"; fi
+    if [[ $PM_INSTALL_SUCCESS == true ]]; then
+        if [[ $virtual_verified == true ]]; then
+            results="Every requested package was verified with pacman -Qq; virtual requirements were verified with pacman -T.$results"
+        else
+            results="Every requested package was verified with pacman -Qq.$results"
+        fi
+    elif (( ${#PM_VERIFY_MISSING[@]} )); then
+        results="One or more requested packages are missing. Overall installation was NOT successful.$results"
+    else
+        results="A package command failed. Overall installation was NOT successful.$results"
+    fi
+    ui_dialog "Installation results" "$results" 0 0 OK
+    PM_INSTALLED_STATE=() PM_INSTALLED_VERSION=()
+    PM_PARENT_BY_KEY=() PM_PARENT_STATE_CACHE=() PM_PARENT_CACHE_SIG=""
+    session_set menu
+    return 0
 }
 
 pm_run_logged() {  # interactive command (the user answers its questions), output kept for a diagnosis
@@ -6279,58 +9334,82 @@ pm_run_logged() {  # interactive command (the user answers its questions), outpu
 }
 
 action_install() {
-    local q key kind name choice rc tries=0
+    local q key choice
     ui_input "Install software" "Search the official repositories and the AUR (name or words from the description):" "" || return 0
     q=${TUI_INPUT//[[:space:]]/ }; q=${q# }; q=${q% }
     [[ -n $q ]] || return 0
+    if (( ${#PM_MARKED[@]} )); then
+        ui_ask "Start a new search and clear the ${#PM_MARKED[@]} marked package(s)?" n || return 0
+        PM_MARKED=()
+    fi
+    PM_SELECTION_ORDER=() PM_AUTO_ADDED=() PM_REINSTALL=() PM_EXTRAS=() PM_EXTRA_SOURCE=() PM_EXTRA_PROVIDER=() PM_CORE_OVERRIDES=()
+    PM_NOTICES=() PM_CONFLICTS=() PM_UNRESOLVED=() PM_AMBIGUOUS=()
+    PM_INSTALLED_STATE=() PM_INSTALLED_VERSION=()
+    PM_PARENT_BY_KEY=() PM_PARENT_STATE_CACHE=() PM_PARENT_CACHE_SIG=""
+    pm_panel_reset
+    [[ -n ${TMP:-} ]] && rm -f "$TMP/selection-records.json" "$TMP/search_meta" "$TMP/search_meta.jsonl"
     log_info "Searching for '$q'… (also asking pkgstats.archlinux.de and the AUR how popular each result is)"
     pm_search "$q"
     if (( ${#R_KEYS[@]} == 0 )); then ui_dialog "Nothing found" "No package matches '$q' in the official repositories or the AUR." 0 0 OK; return 0; fi
-    key=$(ui_choose "Results for '$q'" "📦 official · 🧩 AUR · ✔ installed · 👥 share of Arch users who have it · ★ AUR votes · 🕒 last update · 🔌 needs that program · ↔ variant" "${R_KEYS[@]}") || return 0
-    kind=${key%%:*} name=${key#*:}
-    pm_choose_installer "$kind" || return 0
-    PICKED=()
+    local i
+    local -a results=() marked=()
+    for i in "${!R_KEYS[@]}"; do results+=("${R_KEYS[i]}" "${R_LABELS[i]}"); done
+    PM_ACTION="" PM_FOCUS="" PM_NOTICE=""
     while :; do
-        pm_install_plan "$kind" "$name" "${PICKED[@]}" || { ui_dialog "Package details" "$PLAN_TEXT" 0 0 OK; return 0; }
-        local btns=(Install) body="$PLAN_TEXT"$'\n'"Installs with: $PM_TOOL"
-        (( ${#PLAN_OPT[@]} )) && btns+=("Extras…")
-        btns+=(Cancel)
-        ui_dialog "Install $name" "$body" 0 $(( ${#btns[@]} - 1 )) "${btns[@]}"
-        choice=${btns[TUI_CHOICE]}
-        case $choice in
-            Install) break ;;
-            "Extras…") pm_pick_extras ;;
-            *) return 0 ;;
-        esac
+        while :; do
+            ui_multiselect "Results for '$q'" "📦 official · 🧩 AUR · ✔ installed · 👥 share of Arch users who have it · ★ AUR votes · 🕒 last update · 🔌 needs that program · ↔ variant" "${results[@]}"
+            case $PM_ACTION in
+                details)
+                    key=$PM_FOCUS
+                    if pm_package_details "$key"; then choice=0; else choice=$?; fi
+                    (( choice == 10 )) && break ;;
+                compare)
+                    pm_compare_menu ;;
+                install)
+                    marked=("${!PM_MARKED[@]}")
+                    (( ${#marked[@]} )) || continue
+                    break ;;
+                *) return 0 ;;
+            esac
+        done
+        pm_resolve_marked_selection || return 0
+        if (( ${#PM_INSTALL_AUR[@]} )); then pm_choose_installer aur || return 0
+        else pm_choose_installer repo || return 0; fi
+        while :; do
+            if ! pm_install_plan_many; then
+                ui_dialog "Installation blocked" "$PLAN_TEXT"$'\n\n'"No packages were installed. Your selection has been kept." 0 0 OK
+                return 0
+            fi
+            if pm_install_needs_aur; then
+                if [[ -z ${PM_TOOL:-} || $PM_TOOL == pacman ]]; then pm_choose_installer aur || return 0; fi
+            else
+                PM_TOOL=pacman
+            fi
+            local tools=$PM_TOOL
+            pm_install_needs_aur && tools="pacman (official) · $PM_TOOL (AUR)"
+            local btns=(Install) body="$PLAN_TEXT"$'\n\n'"Installs with: $tools"
+            (( ${#PM_PLAN_OPTIONS[@]} )) && btns+=("Extras…")
+            btns+=(Cancel)
+            local title="Install ${#PM_MARKED[@]} marked packages"
+            if (( ${#PM_MARKED[@]} == 1 )); then
+                for key in "${!PM_MARKED[@]}"; do title="Install ${key#*:}"; done
+            fi
+            ui_dialog "$title" "$body" 0 $(( ${#btns[@]} - 1 )) "${btns[@]}"
+            choice=${btns[TUI_CHOICE]}
+            case $choice in
+                Install) break ;;
+                "Extras…") pm_pick_extras_many || true ;;
+                *) return 0 ;;
+            esac
+        done
+        pm_execute_install_plan
+        [[ $PM_INSTALL_SUCCESS == true ]] || return 0
+        PM_MARKED=() PM_SELECTION_ORDER=() PM_AUTO_ADDED=() PM_REINSTALL=() PM_EXTRAS=() PM_EXTRA_SOURCE=() PM_EXTRA_PROVIDER=() PM_CORE_OVERRIDES=()
+        PM_NOTICES=() PM_CONFLICTS=() PM_UNRESOLVED=() PM_AMBIGUOUS=() PM_INSTALL_REPO=() PM_INSTALL_AUR=()
+        PM_INSTALLED_STATE=() PM_INSTALLED_VERSION=()
+    PM_PARENT_BY_KEY=() PM_PARENT_STATE_CACHE=() PM_PARENT_CACHE_SIG=""
+        pm_panel_reset
     done
-    local removemake=false
-    if (( ${#PLAN_MAKE[@]} )) && [[ $PM_TOOL == paru || $PM_TOOL == yay ]]; then
-        ui_ask "Remove the build-only packages (${PLAN_MAKE[*]}) after it is built? They are not needed to run it." y && removemake=true
-    fi
-    ensure_sudo || return 1
-    session_set task "Installing $name"
-    local cmd=() f="$TMP/install-$name.log"
-    case $PM_TOOL in
-        pacman) cmd=(sudo pacman -S --needed -- "$name" "${PICKED[@]}") ;;
-        pamac)  if [[ $kind == aur ]]; then cmd=(pamac build "$name" "${PICKED[@]}"); else cmd=(pamac install "$name" "${PICKED[@]}"); fi ;;
-        *)      cmd=("$PM_TOOL" -S --needed); [[ $removemake == true ]] && cmd+=(--removemake); cmd+=(-- "$name" "${PICKED[@]}") ;;
-    esac
-    while :; do
-        log_step "Installing $name with $PM_TOOL"
-        pm_run_logged "$f" "${cmd[@]}"; rc=$?
-        if pacman -Qq -- "$name" &>/dev/null; then
-            log_success "$name is installed ($(pacman -Q -- "$name" | awk '{print $2}'))"
-            break
-        fi
-        (( rc == 0 )) && { log_info "Nothing was installed (cancelled at the question?)"; break; }
-        log_error "Installing $name failed (exit code $rc)"
-        (( tries++ )) && break
-        DIAG_DOMAIN=pacman; [[ $kind == aur ]] && DIAG_DOMAIN=aur
-        diagnose "$f" "$DIAG_DOMAIN"; report_diagnosis
-        ui_ask "Apply the fixes above and try again?" y || break
-        apply_fixes || break
-    done
-    session_set menu
 }
 
 pm_how_installed() {  # how a package came onto the system, from /var/log/pacman.log
@@ -7243,7 +10322,7 @@ install_desktop() {
 Type=Application
 Name=Arch Smart Update
 Comment=Update your system and fix common problems automatically
-Exec=bash "$SELF" --gui
+Exec=bash "$SELF" --gui --menu
 Icon=system-software-update
 Terminal=false
 Categories=System;
@@ -7279,7 +10358,7 @@ Interface
   --menu, -i           Open the interactive menu
   --run                Run the full update directly (skip the menu)
   --install-helper [paru|yay|both]  Install an AUR helper (asks which when omitted)
-  --gui                Dialogs + graphical progress (zenity/yad/kdialog), opens a terminal if needed
+  --gui                Dialogs + graphical progress (zenity/yad/kdialog); add --menu to open the menu
   --cli                Terminal only
   --no-notify          No desktop notifications
   --detailed           Detailed view: full output, a plan first, you answer pacman/AUR/Flatpak questions
@@ -7298,7 +10377,7 @@ Scheduled updates (systemd user timer; nothing runs unless you turn it on)
 Other
   --setup              Check what the script needs, explain it, and install what is missing
   --config             Write a config template to $CONFIG_FILE
-  --install-desktop    Add an application-menu launcher (GUI mode)
+  --install-desktop    Add an application-menu launcher (opens the graphical menu)
   --version, -h|--help
 
 Keys while running
@@ -7356,7 +10435,7 @@ parse_args() {
             --run)         MENU_REQUESTED=false ;;
             --download-only) DOWNLOAD_ONLY=true; DO_AUR=false; DO_CLEANUP=false ;;
             --slow-net)    SLOW_LEVEL=1 ;;
-            --install-helper) INSTALL_HELPER=${2:-ask}; [[ ${2:-} != -* && -n ${2:-} ]] && shift ;;
+            --install-helper) INSTALL_HELPER_REQUEST=${2:-ask}; [[ ${2:-} != -* && -n ${2:-} ]] && shift ;;
             --config)      create_config; exit 0 ;;
             --install-desktop) install_desktop; exit 0 ;;
             --version)     echo "$VERSION"; exit 0 ;;
@@ -7376,6 +10455,7 @@ on_exit() {
     [[ -n $STTY_ORIG ]] && stty "$STTY_ORIG" </dev/tty 2>/dev/null
     [[ -n $SUDO_PID ]] && kill "$SUDO_PID" 2>/dev/null
     [[ -n $TICKER_PID ]] && kill "$TICKER_PID" 2>/dev/null
+    [[ $BASHPID == "$$" && -n ${PM_PANEL_PID:-} ]] && pm_panel_cancel
     [[ -n $PROG_FD ]] && exec {PROG_FD}>&- 2>/dev/null
     [[ -t 1 ]] && printf '\033]0;\007'
     [[ -n $TMP && -d $TMP ]] && rm -rf "$TMP"
@@ -7417,6 +10497,15 @@ main() {
         exit 0
     fi
 
+    if [[ $MENU_REQUESTED == true && ! -t 0 ]]; then
+        if { : </dev/tty; } 2>/dev/null; then
+            exec </dev/tty
+        elif [[ -z ${DISPLAY:-${WAYLAND_DISPLAY:-}} ]]; then
+            echo "Cannot open the interactive menu: no usable terminal was found. Run $PROG from a terminal, or use --gui --menu in a desktop session." >&2
+            return 1
+        fi
+    fi
+
     # Decide on GUI vs CLI
     if [[ $UI_MODE == gui || ( $UI_MODE == auto && ! -t 0 && -n ${DISPLAY:-${WAYLAND_DISPLAY:-}} ) ]]; then
         if detect_gui_tool; then
@@ -7425,6 +10514,12 @@ main() {
         else
             echo "No zenity/yad/kdialog found — falling back to terminal mode (sudo pacman -S zenity)"
         fi
+    fi
+
+    if [[ $MENU_REQUESTED == true && ! -t 0 && $GUI != true ]]; then
+        [[ -n ${SMART_UPDATE_IN_TERM:-} ]] || relaunch_in_terminal || true
+        echo "Cannot open the interactive menu: no usable terminal was found. Run $PROG from a terminal, or use --gui --menu in a desktop session." >&2
+        return 1
     fi
 
     # one session per user: a second terminal shows the first one's progress instead of starting another
@@ -7454,8 +10549,8 @@ main() {
     if [[ ${REPORT_ONLY:-} == true ]]; then
         write_report deep; cat "$REPORT_FILE"; return 0
     fi
-    if [[ -n ${INSTALL_HELPER:-} ]]; then
-        local arg=$INSTALL_HELPER; [[ $arg == ask ]] && arg=""
+    if [[ -n ${INSTALL_HELPER_REQUEST:-} ]]; then
+        local arg=$INSTALL_HELPER_REQUEST; [[ $arg == ask ]] && arg=""
         install_aur_helper "$arg"; return
     fi
     if [[ $MENU_REQUESTED == true || ( -z $MENU_REQUESTED && $# -eq 0 && -t 0 && -t 1 ) ]]; then
