@@ -35,7 +35,7 @@
 set -o pipefail
 shopt -s nullglob
 
-VERSION="4.1.0"
+VERSION="4.2.0"
 SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 PROG="${SELF##*/}"
 ORIG_ARGS=("$@")
